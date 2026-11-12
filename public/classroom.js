@@ -12,7 +12,7 @@ function sampleData() {
 }
 
 export function openClassroom(app, { preview, id, request }) {
-  let disposed = false, index = 0, data, observer, active, timer, z = 1, playback = 0;
+  let disposed = false, index = 0, data, observer, active, timer, z = 1, playback = 0, refreshing = false;
   const positions = new Map(), events = new AbortController();
   const audio = new Audio();
   let source;
@@ -30,7 +30,7 @@ export function openClassroom(app, { preview, id, request }) {
     stop(); observer?.disconnect();
     const q = data.assignment.sentences[index];
     const rows = data.sessions.filter(s => s.answers.some(a => a.sentenceId === q?.id && a.audioUrl));
-    app.innerHTML = `<section class="classroom"><div class="classroom-top"><a href="#teacher" class="classroom-back">← 教師工作台</a><span class="live-label"><i></i> CLASSROOM LIVE</span><span>${preview ? '示意模式 · 虛構學生資料' : '上課互動式演示'}</span></div><div class="classroom-heading"><div><div class="eyebrow">LISTEN. MOVE. DISCOVER.</div><h1>${escape(data.assignment.title)}</h1><p>讓每個聲音，都有被聽見的位置。</p></div><div class="classroom-tools"><button class="secondary" id="resetBoard">↺ 重新排列</button><button class="secondary" id="fullscreen">⛶ 全螢幕</button></div></div><div class="question-panel"><span class="question-number">${String(index + 1).padStart(2, '0')}</span><div><span class="question-caption">本題朗讀 · ${rows.length} 份錄音</span><h2>${escape(q?.text || '尚無題目')}</h2><p>${escape(q?.pinyin || '')}</p></div><span class="question-mark">“</span></div><div class="stage-label"><span>✦ 聲音舞台 <small>拖曳卡片，自由安排你的課堂</small></span><span>${preview ? '播放為進度模擬，無學生音訊' : data.assignment.deidentifyVoice ? '播放聲音去識別化錄音' : '點擊 ▶ 聆聽'}</span></div><div class="voice-stage" aria-label="可拖曳的學生錄音舞台"></div><div class="classroom-bottom"><span>◉ 位置僅保留於本次演示</span><div class="question-nav"><button id="questionPrev" class="secondary" ${index === 0 ? 'disabled' : ''}>← 上一題</button><span>${index + 1} <small>/ ${data.assignment.sentences.length}</small></span><button id="questionNext" ${index >= data.assignment.sentences.length - 1 ? 'disabled' : ''}>下一題 →</button></div><span>← → 切換題目</span></div></section>`;
+    app.innerHTML = `<section class="classroom"><div class="classroom-top"><a href="#teacher" class="classroom-back">← 教師工作台</a><span class="live-label"><i></i> CLASSROOM LIVE</span><span>${preview ? '示意模式 · 虛構學生資料' : '上課互動式演示'}</span></div><div class="classroom-heading"><div><div class="eyebrow">LISTEN. MOVE. DISCOVER.</div><h1>${escape(data.assignment.title)}</h1><p>讓每個聲音，都有被聽見的位置。</p></div><div class="classroom-tools"><button class="secondary" id="refreshBoard" ${preview ? 'disabled title="示意模式沒有即時錄音"' : ''}>↻ 更新錄音</button><button class="secondary" id="resetBoard">↺ 重新排列</button><button class="secondary" id="fullscreen">⛶ 全螢幕</button></div></div><div class="classroom-refresh-status" role="status" aria-live="polite"></div><div class="question-panel"><span class="question-number">${String(index + 1).padStart(2, '0')}</span><div><span class="question-caption">本題朗讀 · ${rows.length} 份錄音</span><h2>${escape(q?.text || '尚無題目')}</h2><p>${escape(q?.pinyin || '')}</p></div><span class="question-mark">“</span></div><div class="stage-label"><span>✦ 聲音舞台 <small>拖曳卡片，自由安排你的課堂</small></span><span>${preview ? '播放為進度模擬，無學生音訊' : data.assignment.deidentifyVoice ? '播放聲音去識別化錄音' : '點擊 ▶ 聆聽'}</span></div><div class="voice-stage" aria-label="可拖曳的學生錄音舞台"></div><div class="classroom-bottom"><span>◉ 位置僅保留於本次演示</span><div class="question-nav"><button id="questionPrev" class="secondary" ${index === 0 ? 'disabled' : ''}>← 上一題</button><span>${index + 1} <small>/ ${data.assignment.sentences.length}</small></span><button id="questionNext" ${index >= data.assignment.sentences.length - 1 ? 'disabled' : ''}>下一題 →</button></div><span>← → 切換題目</span></div></section>`;
     enhanceQuestion(app.querySelector('.question-panel h2'), data.assignment.language || 'zh-TW');
     app.querySelector('.question-panel p').classList.add('notranslate');
     app.querySelector('.question-panel p').setAttribute('translate', 'no');
@@ -110,6 +110,29 @@ export function openClassroom(app, { preview, id, request }) {
     });
     observer = new ResizeObserver(() => stage.querySelectorAll('.voice-card').forEach(c => c.place())); observer.observe(stage);
     app.querySelector('#resetBoard').onclick = () => { positions.delete(q?.id); draw(); };
+    app.querySelector('#refreshBoard').onclick = async () => {
+      if (preview || refreshing) return;
+      refreshing = true;
+      const button = app.querySelector('#refreshBoard');
+      const status = app.querySelector('.classroom-refresh-status');
+      button.disabled = true;
+      button.textContent = '更新中…';
+      status.textContent = '正在取得最新錄音…';
+      try {
+        const latest = await request(`/api/teacher/assignments/${id}`, { cache: 'no-store' });
+        if (disposed) return;
+        data = latest;
+        index = Math.min(index, data.assignment.sentences.length - 1);
+        draw();
+        app.querySelector('.classroom-refresh-status').textContent = `已更新，本題共有 ${data.sessions.filter(s => s.answers.some(a => a.sentenceId === data.assignment.sentences[index]?.id && a.audioUrl)).length} 份錄音。`;
+      } catch (error) {
+        if (!disposed) {
+          status.textContent = `更新失敗：${error.message}`;
+          button.disabled = false;
+          button.textContent = '↻ 更新錄音';
+        }
+      } finally { refreshing = false; }
+    };
     app.querySelector('#questionPrev').onclick = () => change(-1);
     app.querySelector('#questionNext').onclick = () => change(1);
     app.querySelector('#fullscreen').onclick = async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else await app.requestFullscreen(); } catch { app.querySelector('#fullscreen').textContent = '瀏覽器不支援全螢幕'; } };

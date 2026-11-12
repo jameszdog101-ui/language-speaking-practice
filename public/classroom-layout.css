@@ -44,3 +44,4 @@
 .classroom button.secondary{background:#fff;color:#4c1d95;border-color:#c7bde0}
 .classroom-tools button{white-space:nowrap;flex-shrink:0}
 @media(max-width:800px){.classroom-mode main{width:calc(100% - 24px);padding-top:14px}.classroom-heading{padding:18px 0 14px}.classroom-tools{flex-wrap:wrap;width:100%}.classroom-tools button{flex:1 1 140px}.stage-label{padding-top:14px}.voice-card{width:min(260px,calc(100% - 12px))}.classroom-top{padding-bottom:12px}}
+.classroom-refresh-status:not(:empty){margin:-12px 0 16px;color:#55705f;font-size:13px}
