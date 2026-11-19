@@ -45,3 +45,13 @@
 .classroom-tools button{white-space:nowrap;flex-shrink:0}
 @media(max-width:800px){.classroom-mode main{width:calc(100% - 24px);padding-top:14px}.classroom-heading{padding:18px 0 14px}.classroom-tools{flex-wrap:wrap;width:100%}.classroom-tools button{flex:1 1 140px}.stage-label{padding-top:14px}.voice-card{width:min(260px,calc(100% - 12px))}.classroom-top{padding-bottom:12px}}
 .classroom-refresh-status:not(:empty){margin:-12px 0 16px;color:#55705f;font-size:13px}
+
+.voice-card-top > div { min-width: 0; overflow-wrap: anywhere; }
+.voice-card .voice-submitted { font-variant-numeric: tabular-nums; }
+.voice-options { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.voice-options label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; }
+.voice-options select { width: auto; min-height: 44px; margin: 0; padding: 0 6px; font-size: 13px; }
+.classroom .voice-options button { padding: 4px 10px; }
+.voice-card.voice-card-expanded { width: 350px; }
+.voice-card-expanded .voice-card-top b { font-size: 19px; }
+.voice-card-expanded .voice-wave { height: 46px; }

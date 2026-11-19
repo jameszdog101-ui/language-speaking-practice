@@ -1,3 +1,31 @@
+const managedStudent = `(?='super_admin' OR EXISTS (
+  SELECT 1 FROM teacher_students ts WHERE ts.student_id=s.id AND ts.teacher_id=?
+))`;
+const studentDeletionAllowed = `(?='super_admin' OR (
+  EXISTS (SELECT 1 FROM teacher_students ts WHERE ts.student_id=s.id AND ts.teacher_id=?)
+  AND NOT EXISTS (SELECT 1 FROM teacher_students ts WHERE ts.student_id=s.id AND ts.teacher_id<>?)
+  AND NOT EXISTS (SELECT 1 FROM sessions se JOIN assignments a ON a.id=se.assignment_id
+    WHERE se.student_account_id=s.id AND a.teacher_id IS NOT ?)
+  AND NOT EXISTS (SELECT 1 FROM assignment_recipients r JOIN assignments a ON a.id=r.assignment_id
+    WHERE r.student_id=s.id AND a.teacher_id IS NOT ?)
+))`;
+const deletionBindings = t => [t.role, t.id, t.id, t.id, t.id];
+
+export async function purgeStudentAudio(env, studentId = null) {
+  const where = studentId ? 'WHERE student_id=?' : '';
+  const bindings = studentId ? [studentId] : [];
+  for (let batch = 0; batch < 20; batch++) {
+    const { results } = await env.DB.prepare(`SELECT r2_key FROM student_audio_deletions ${where} ORDER BY r2_key LIMIT 100`)
+      .bind(...bindings).all();
+    if (!results.length) return true;
+    const keys = results.map(row => row.r2_key);
+    await env.AUDIO.delete(keys);
+    await env.DB.prepare('DELETE FROM student_audio_deletions WHERE r2_key IN (SELECT value FROM json_each(?))')
+      .bind(JSON.stringify(keys)).run();
+  }
+  return false;
+}
+
 export function studentServices(h) {
   const { response, fail, id, token, hash, passwordHash, cookie, teacher, bodyJson } = h;
   const authCookie = (value, secure, age=604800) => `student_session=${encodeURIComponent(value)}; Path=/; HttpOnly; ${secure ? 'Secure; ' : ''}SameSite=Lax; Max-Age=${age}`;
@@ -49,7 +77,9 @@ export function studentServices(h) {
     if(!path.startsWith('/api/teacher/students')) return null;
     const t=await teacher(req,env); if(!t) return fail('請先登入教師帳號',401);
     if(path === '/api/teacher/students' && req.method === 'GET') {
-      const rows = await env.DB.prepare(`SELECT s.id,s.username,s.display_name,s.student_number,s.disabled_at,s.must_change_password FROM students s WHERE ?='super_admin' OR EXISTS(SELECT 1 FROM teacher_students ts WHERE ts.teacher_id=? AND ts.student_id=s.id) ORDER BY s.created_at DESC`).bind(t.role,t.id).all();
+      const rows = await env.DB.prepare(`SELECT s.id,s.username,s.display_name,s.student_number,s.disabled_at,s.must_change_password,
+        ${studentDeletionAllowed} can_delete FROM students s WHERE ${managedStudent} ORDER BY s.created_at DESC`)
+        .bind(...deletionBindings(t), t.role, t.id).all();
       return response({students:rows.results});
     }
     if(path === '/api/teacher/students' && req.method === 'POST') {
@@ -64,8 +94,24 @@ export function studentServices(h) {
       return response({id:studentId},201);
     }
     const match=/^\/api\/teacher\/students\/([^/]+)$/.exec(path);
+    if (match && req.method === 'DELETE') {
+      const studentId = match[1];
+      const s = await env.DB.prepare(`SELECT s.username,${studentDeletionAllowed} can_delete FROM students s
+        WHERE s.id=? AND ${managedStudent}`).bind(...deletionBindings(t), studentId, t.role, t.id).first();
+      if (!s) return fail('找不到學生帳號', 404);
+      if (!s.can_delete) return fail('此帳號有其他教師的指派或作答關聯，請由最高管理員刪除', 403);
+      const body = await bodyJson(req);
+      if (body?.confirmUsername !== s.username) return fail('請輸入完整且相符的學生帳號以確認刪除');
+      const deleted = await env.DB.prepare(`DELETE FROM students AS s WHERE s.id=? AND s.username COLLATE BINARY=?
+        AND ${studentDeletionAllowed}`).bind(studentId, body.confirmUsername, ...deletionBindings(t)).run();
+      if (!deleted.meta.changes) return fail('帳號資料或存取權限已變更，請重新整理後再試', 409);
+      let audioDeleted = false;
+      try { audioDeleted = await purgeStudentAudio(env, studentId); }
+      catch { /* The scheduled handler retries pending R2 deletions. */ }
+      return response({ ok: true, audioPending: !audioDeleted });
+    }
     if(match && req.method === 'PATCH') {
-      const s=await env.DB.prepare(`SELECT s.id FROM students s WHERE s.id=? AND (?='super_admin' OR EXISTS(SELECT 1 FROM teacher_students ts WHERE ts.student_id=s.id AND ts.teacher_id=?))`).bind(match[1],t.role,t.id).first();
+      const s=await env.DB.prepare(`SELECT s.id FROM students s WHERE s.id=? AND ${managedStudent}`).bind(match[1],t.role,t.id).first();
       if(!s) return fail('找不到學生帳號',404);
       const b=await bodyJson(req), statements=[];
       if(b.password !== undefined) {

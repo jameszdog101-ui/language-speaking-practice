@@ -33,6 +33,23 @@
         "preview_bucket_name": "mandarin-speaking-practice-audio-staging"
       }],
       "vars": { "APP_ENV": "staging", "OWNER_EMAIL": "jameszdog101@gmail.com" }
+    },
+    "feature-staging": {
+      "name": "language-speaking-practice",
+      "workers_dev": true,
+      "triggers": { "crons": ["17 3 * * *"] },
+      "d1_databases": [{
+        "binding": "DB",
+        "database_name": "mandarin-speaking-practice-feature-staging",
+        "database_id": "5a529e20-499f-4fb5-a996-06fea997b2aa",
+        "migrations_dir": "migrations"
+      }],
+      "r2_buckets": [{
+        "binding": "AUDIO",
+        "bucket_name": "mandarin-speaking-practice-audio-feature-staging",
+        "preview_bucket_name": "mandarin-speaking-practice-audio-feature-staging"
+      }],
+      "vars": { "APP_ENV": "feature-staging", "OWNER_EMAIL": "jameszdog101@gmail.com" }
     }
   }
 }

@@ -11,8 +11,8 @@ export async function historyRoutes(req,env,url,{student,response,fail}) {
   if(match) {
     const s=await env.DB.prepare('SELECT s.* FROM sessions s JOIN assignments a ON a.id=s.assignment_id WHERE s.id=? AND s.student_account_id=? AND s.deleted_at IS NULL AND a.deleted_at IS NULL').bind(match[1],account.id).first();
     if(!s) return fail('找不到提交紀錄',404);
-    const rows=await env.DB.prepare('SELECT se.id,se.text,se.pinyin,at.id audio_id FROM answers an JOIN sentences se ON se.id=an.sentence_id LEFT JOIN attempts at ON at.session_id=an.session_id AND at.sentence_id=an.sentence_id AND at.attempt_number=an.accepted_attempt AND at.deleted_at IS NULL WHERE an.session_id=? ORDER BY se.position').bind(s.id).all();
-    return response({answers:rows.results.map(x=>({...x,audioUrl:x.audio_id?`/api/student/audio/${x.audio_id}`:null}))});
+    const rows=await env.DB.prepare('SELECT an.sentence_id id,an.question_text text,an.question_pinyin pinyin,an.recording_seconds_snapshot recordingSeconds,at.id audio_id FROM answers an LEFT JOIN attempts at ON at.session_id=an.session_id AND at.sentence_id=an.sentence_id AND at.attempt_number=an.accepted_attempt AND at.deleted_at IS NULL WHERE an.session_id=? ORDER BY an.question_position').bind(s.id).all();
+    return response({assignment:{id:s.assignment_id,language:s.assignment_language},completedAt:s.completed_at,answers:rows.results.map(x=>({...x,audioUrl:x.audio_id?`/api/student/audio/${x.audio_id}`:null}))});
   }
   const audio=/^\/api\/student\/audio\/([^/]+)$/.exec(url.pathname);
   if(audio) {
