@@ -6,8 +6,8 @@ import { submissionRoutes, purgeSubmissions } from './submissions.mjs';
 import { wavDuration, audioResponse } from './audio.mjs';
 import { readLimits, readQuestions, rosterStatements } from './assignment-settings.mjs';
 import { rosterRoutes } from './rosters.mjs';
-import { cardWrites, claimVocabulary, finishVocabulary, learningRoutes } from './learning.mjs';
-import { generateVocabulary } from './gemini.mjs';
+import { cardWrites, claimVocabulary, finishVocabulary, learningRoutes, vocabularyStatus } from './learning.mjs';
+import { generateVocabulary, splitAssignmentText } from './gemini.mjs';
 const MAX_AUDIO = 15 * 1024 * 1024;
 const AUDIO_TYPES = new Set([
   "audio/webm",
@@ -80,7 +80,7 @@ function token(bytes = 24) {
     .replaceAll("/", "_")
     .replaceAll("=", "");
 }
-async function hash(value) {
+export async function hash(value) {
   const data = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(digest)]
@@ -292,12 +292,19 @@ async function purgeExpired(env) {
 
 const students = studentServices({response, fail, id, token, hash, passwordHash, cookie, teacher, bodyJson});
 async function api(req, env, url, ctx) {
+  if (!['GET','HEAD','OPTIONS'].includes(req.method) && req.headers.get('origin') && req.headers.get('origin') !== url.origin) return fail('禁止跨站操作', 403);
   const learningResult = await learningRoutes(req, env, url, { teacher, student: students.student, canEdit, response, fail, bodyJson, hash, authorizeSession, waitUntil: promise => ctx?.waitUntil(promise) });
   if (learningResult) return learningResult;
   const rosterResult = await rosterRoutes(req, env, url, { teacher, student: students.student, response, fail });
   if (rosterResult) return rosterResult;
   const lookup = await dictionary(req, url, response, fail); if (lookup) return lookup;
-  if (!['GET','HEAD','OPTIONS'].includes(req.method) && req.headers.get('origin') && req.headers.get('origin') !== url.origin) return fail('禁止跨站操作', 403);
+  if (req.method === 'POST' && url.pathname === '/api/teacher/assignments/split') {
+    const t = await teacher(req, env);
+    if (!t) return fail('請先登入教師帳號', 401);
+    try {
+      return response({ questions: await splitAssignmentText(env, t.id, await bodyJson(req)) });
+    } catch (error) { return fail(error.message, 422); }
+  }
   const studentResult = await students.routes(req, env, url); if(studentResult) return studentResult;
   const feedbackResult = await feedbackRoutes(req,env,url,{teacher,student:students.student,canEdit,response,fail,bodyJson,id}); if(feedbackResult) return feedbackResult;
   const historyResult = await historyRoutes(req,env,url,{student:students.student,response,fail}); if(historyResult) return historyResult;
@@ -733,7 +740,8 @@ async function api(req, env, url, ctx) {
     if (!a || !canEdit(t, a)) return fail("找不到作業或無權檢視", 404);
     const ss = (
       await env.DB.prepare(
-        "SELECT * FROM sessions WHERE assignment_id=? AND deleted_at IS NULL ORDER BY started_at DESC",
+        `SELECT s.*, EXISTS(SELECT 1 FROM student_avatars sa WHERE sa.student_id=s.student_account_id) has_avatar
+        FROM sessions s WHERE s.assignment_id=? AND s.deleted_at IS NULL ORDER BY s.started_at DESC`,
       )
         .bind(a.id)
         .all()
@@ -761,6 +769,7 @@ async function api(req, env, url, ctx) {
     }
     const questions = await sentences(env, a.id);
     const recipients = await env.DB.prepare('SELECT student_id FROM assignment_recipients WHERE assignment_id=?').bind(a.id).all();
+    const vocabulary = vocabularyStatus(a);
     return response({
       assignment: {
         ...publicAssignment(a, questions),
@@ -772,8 +781,8 @@ async function api(req, env, url, ctx) {
         teacherId: a.teacher_id,
         vocabularyReady: a.vocabulary_version >= 2,
         canEditVocabulary: t.id === a.teacher_id && a.vocabulary_version >= 2,
-        vocabularyGenerating: Boolean(a.vocabulary_job_until && a.vocabulary_job_until > new Date().toISOString()),
-        vocabularyError: a.vocabulary_job_error,
+        vocabularyGenerating: vocabulary.generating,
+        vocabularyError: vocabulary.error,
         canEdit: true,
         hasSubmissions: Boolean(a.identity_locked),
       },
@@ -782,6 +791,8 @@ async function api(req, env, url, ctx) {
         name: s.name,
         studentId: s.student_id,
         anonymousId: s.anonymous_id,
+        avatarUrl: s.has_avatar && !s.anonymous_id && !a.anonymous && a.identity_mode !== 'anonymous'
+          ? `/api/teacher/session-avatar/${s.id}` : null,
         startedAt: s.started_at,
         completedAt: s.completed_at,
         answers: s.answers,

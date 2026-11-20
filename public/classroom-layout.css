@@ -52,6 +52,61 @@
 .voice-options label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; }
 .voice-options select { width: auto; min-height: 44px; margin: 0; padding: 0 6px; font-size: 13px; }
 .classroom .voice-options button { padding: 4px 10px; }
-.voice-card.voice-card-expanded { width: 350px; }
+.voice-stage { --voice-expanded-width: min(350px, calc(100% - 12px)); container-type: inline-size; }
+.voice-stage .voice-card { width: calc(var(--voice-expanded-width) / 3); }
+.voice-stage .voice-card-expanded { width: var(--voice-expanded-width); }
+.voice-card:not(.voice-card-expanded) .voice-card-inner {
+  aspect-ratio: 4 / 3;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  min-height: 0;
+  padding: 4px 7px;
+  border-radius: 12px;
+}
+.voice-card:not(.voice-card-expanded) .voice-card-top { grid-column: 1 / -1; }
+.voice-card:not(.voice-card-expanded) .voice-card-top { gap: 1px; }
+.voice-card:not(.voice-card-expanded) .avatar {
+  width: 22px;
+  margin-right: 3px;
+  border-radius: 6px;
+}
+.voice-card:not(.voice-card-expanded) .voice-card-top b {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.voice-card:not(.voice-card-expanded) :is(.voice-card-top small, .voice-wave, .voice-time, .voice-seek, .voice-options label, .voice-original-question, .voice-status:not(.has-error)) {
+  display: none;
+}
+.voice-card:not(.voice-card-expanded) :is(.voice-player, .voice-options) { margin: 0; }
+.voice-card:not(.voice-card-expanded) .voice-status.has-error {
+  position: absolute;
+  top: 100%;
+  inset-inline: 0;
+  padding: 6px;
+  background: #fff;
+  border: 1px solid #c7bde0;
+  border-radius: 8px;
+}
+.classroom .voice-card:not(.voice-card-expanded) :is(.drag-handle, .play, .voice-options button) {
+  width: 34px;
+  height: 34px;
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+}
+@container (max-width: 300px) {
+  .voice-card:not(.voice-card-expanded) .voice-card-inner { padding: 3px 4px; }
+  .classroom .voice-card:not(.voice-card-expanded) :is(.drag-handle, .play, .voice-options button) {
+    width: 27px;
+    height: 27px;
+    font-size: 12px;
+  }
+  .voice-card:not(.voice-card-expanded) .avatar { width: 17px; }
+}
+.voice-card .avatar { height: auto; }
 .voice-card-expanded .voice-card-top b { font-size: 19px; }
 .voice-card-expanded .voice-wave { height: 46px; }

@@ -1,6 +1,25 @@
 const cache = new Map();
 let popup, selected, generation = 0;
-export function stopSpeech() { window.speechSynthesis?.cancel(); }
+let activeQuestion;
+const questionRateKey = 'questionPlaybackRate';
+const minQuestionRate = 0.5, maxQuestionRate = 2;
+let questionRate = Number(localStorage.getItem(questionRateKey)) || 1;
+if (questionRate < minQuestionRate || questionRate > maxQuestionRate) questionRate = 1;
+
+function changeQuestionRate(value, commit, source) {
+  questionRate = Math.round(Math.max(minQuestionRate, Math.min(maxQuestionRate, value)) * 100) / 100;
+  for (const player of document.querySelectorAll('.question-player')) {
+    player.dispatchEvent(new CustomEvent('questionrate', { detail: { commit, source } }));
+  }
+  if (commit) localStorage.setItem(questionRateKey, String(questionRate));
+}
+
+export function stopSpeech() {
+  const current = activeQuestion;
+  activeQuestion = null;
+  current?.pause();
+  window.speechSynthesis?.cancel();
+}
 export function closeWord() {
   generation++;
   popup?.remove(); popup = null;
@@ -67,6 +86,11 @@ function contextualCard(button, card, entry) {
   close.onclick = () => { closeWord(); button.focus(); };
   popup.append(title, play, close, cardDetails(card));
   if (entry.onVocabularyEdited) {
+    if (card.reviewFields?.length) {
+      const review = document.createElement('p');
+      review.textContent = '待教師補充：' + card.reviewFields.join('、');
+      popup.append(review);
+    }
     const edit = document.createElement('button');
     edit.type = 'button';
     edit.className = 'secondary';
@@ -100,7 +124,7 @@ function contextualCard(button, card, entry) {
 function vocabularyForm(card, entry) {
   const form = document.createElement('form');
   form.className = 'vocabulary-card-edit';
-  const input = (name, label, value, multiline = false, limit = 350) => {
+  const input = (name, label, value, multiline = false, limit = 350, required = true) => {
     const wrapper = document.createElement('label');
     wrapper.textContent = label;
     const control = document.createElement(multiline ? 'textarea' : 'input');
@@ -108,15 +132,25 @@ function vocabularyForm(card, entry) {
     control.value = value;
     control.maxLength = limit;
     if (multiline) control.rows = 3;
-    control.required = name !== 'similar';
+    control.required = required;
     wrapper.append(control);
     form.append(wrapper);
   };
   input('pronunciation', card.language === 'en' ? 'KK 音標' : '漢語拼音', card.pronunciation, false, 180);
+  input('partOfSpeech', '詞性', card.partOfSpeech || '', false, 80, Boolean(card.partOfSpeech));
+  input('baseForm', '原形', card.baseForm || '', false, 180, card.language === 'en' && Boolean(card.baseForm));
+  if (card.language === 'en') {
+    input('wordFamily', '詞族（每行一項：詞形｜詞性｜英文例句（中文翻譯））',
+      (card.wordFamily || []).map(item => typeof item === 'string' ? item : [item.word, item.partOfSpeech, item.example].join('｜')).join('\n'),
+      true, 3700, false);
+    input('verbForms', '動詞三態（依序每行填寫原形、過去式、過去分詞）', (card.verbForms || []).join('\n'), true, 550, false);
+  }
   input('meaning', '語境翻譯', card.meaning);
-  input('usage', '使用情境', card.usage || '');
-  input('examples', '例句（每行一個）', card.examples.join('\n'), true, 1200);
-  input('similar', '相似詞（每行一個）', card.similar.join('\n'), true, 1200);
+  input('usage', card.language === 'en' ? '英文使用情境' : '使用情境', card.usage || '');
+  if (card.language === 'en') input('usageZh', '使用情境的中文解釋', card.usageZh || '', false, 350, Boolean(card.usageZh));
+  input('examples', card.language === 'en' ? '例句（每行一個，英文後加上括號中文翻譯）' : '例句（每行一個）',
+    card.examples.join('\n'), true, 1200, false);
+  input('similar', '相似詞（每行一個）', card.similar.join('\n'), true, 1200, false);
   const save = document.createElement('button');
   save.textContent = '儲存語塊卡';
   const status = document.createElement('p');
@@ -130,7 +164,12 @@ function vocabularyForm(card, entry) {
       const reply = await fetch('/api/teacher/question-vocabulary/' + encodeURIComponent(entry.questionId), {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...fields, revision: entry.revision, cardId: card.id,
-          examples: fields.examples.split('\n'), similar: fields.similar.split('\n') }),
+          examples: fields.examples.split('\n'), similar: fields.similar.split('\n'),
+          wordFamily: (fields.wordFamily || '').split('\n').map(line => line.trim()).filter(Boolean).map(line => {
+            const [word, partOfSpeech, ...example] = line.split('｜');
+            return partOfSpeech === undefined ? line : { word, partOfSpeech, example: example.join('｜') };
+          }),
+          verbForms: (fields.verbForms || '').split('\n').filter(line => line.trim()) }),
       });
       const result = await reply.json();
       if (!reply.ok) throw Error(result.error || '無法儲存語塊卡');
@@ -155,8 +194,30 @@ function cardDetails(card) {
     container.append(line);
   };
   append(card.language === 'en' ? 'KK 音標' : '拼音', card.pronunciation);
+  append('詞性', card.partOfSpeech);
+  append('原形', card.baseForm);
+  append('動詞三態', card.verbForms?.join(' – '));
+  if (card.wordFamily?.length) {
+    const title = document.createElement('b');
+    title.textContent = '詞族與詞形變化';
+    const list = document.createElement('ul');
+    for (const family of card.wordFamily) {
+      const item = document.createElement('li');
+      if (typeof family === 'string') item.textContent = family;
+      else {
+        const word = document.createElement('b');
+        word.textContent = `${family.word}（${family.partOfSpeech}）`;
+        const example = document.createElement('div');
+        example.textContent = family.example;
+        item.append(word, example);
+      }
+      list.append(item);
+    }
+    container.append(title, list);
+  }
   append(card.language === 'en' ? '上下文中文意思' : '上下文英文意思', card.meaning);
   append(card.language === 'en' ? '英文使用情境' : '中文使用情境', card.usage);
+  if (card.language === 'en') append('使用情境的中文解釋', card.usageZh);
   if (card.examples.length) {
     const list = document.createElement('ul');
     list.setAttribute('aria-label', `例句（${card.cefr}）`);
@@ -189,65 +250,286 @@ async function learningRequest(path, data, token) {
 
 const audioPreviews = new Map();
 const audioObserver = new MutationObserver(() => {
+  if (activeQuestion && !activeQuestion.element.isConnected) stopSpeech();
   for (const [element, url] of audioPreviews) if (!element.isConnected) { element.pause(); URL.revokeObjectURL(url); audioPreviews.delete(element); }
 });
 audioObserver.observe(document.body, { childList: true, subtree: true });
 
-function installQuestionAudio(read, url, token) {
-  const audio = document.createElement('audio');
-  audio.className = 'question-audio';
-  audio.controls = true;
-  audio.preload = 'none';
-  audio.dataset.playbackReady = 'true';
-  audio.setAttribute('aria-label', '題目朗讀音檔');
-  if (!token) {
-    audio.src = url;
-    read.replaceWith(audio);
-    return;
+function questionPlayer(text, language, words, highlight) {
+  const element = document.createElement('span');
+  element.className = 'question-player';
+  const sentenceEnds = Array.from(new Intl.Segmenter(language, { granularity: 'sentence' }).segment(text),
+    sentence => sentence.index + sentence.segment.length);
+  const play = document.createElement('button');
+  play.type = 'button';
+  play.className = 'question-read';
+  const seek = document.createElement('input');
+  seek.type = 'range'; seek.min = 0; seek.max = words.length; seek.step = 1;
+  seek.setAttribute('aria-label', '即時朗讀字詞進度');
+  const progress = document.createElement('span');
+  const speed = document.createElement('span');
+  speed.className = 'question-rate';
+  const rateLabel = document.createElement('label');
+  rateLabel.textContent = '語速 ';
+  const rate = document.createElement('input');
+  rate.type = 'number';
+  rate.inputMode = 'decimal';
+  rateLabel.append(rate, '×');
+  const rateSlider = document.createElement('input');
+  rateSlider.type = 'range';
+  rateSlider.setAttribute('aria-label', '語速滑桿');
+  for (const input of [rate, rateSlider]) {
+    input.min = minQuestionRate;
+    input.max = maxQuestionRate;
+    input.step = '0.01';
+    input.value = questionRate;
   }
-  read.setAttribute('aria-label', '載入題目朗讀音檔');
-  read.onclick = async () => {
-    read.disabled = true;
+  rate.oninput = () => {
+    if (rate.valueAsNumber >= minQuestionRate && rate.valueAsNumber <= maxQuestionRate)
+      changeQuestionRate(rate.valueAsNumber, false, rate);
+  };
+  const saveTypedRate = () => changeQuestionRate(Number.isFinite(rate.valueAsNumber) ? rate.valueAsNumber : questionRate, true);
+  rate.onchange = saveTypedRate;
+  rate.onkeydown = event => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    saveTypedRate();
+    rate.blur();
+  };
+  rateSlider.oninput = () => changeQuestionRate(rateSlider.valueAsNumber, false);
+  rateSlider.onchange = () => changeQuestionRate(rateSlider.valueAsNumber, true);
+  speed.append(rateLabel, rateSlider);
+  let position = 0, utterance, resumeAfterSeek = false, tracking = false;
+  const playback = { element, pause() { utterance = null; update(); } };
+  function update() {
+    const playing = activeQuestion === playback;
+    play.textContent = playing ? 'Ⅱ' : '▶';
+    play.setAttribute('aria-label', playing ? '暫停題目朗讀' : '播放題目朗讀');
+    seek.value = position;
+    progress.textContent = `${tracking ? Math.min(position + 1, words.length) : 0} / ${words.length} 詞`;
+    seek.setAttribute('aria-valuetext', progress.textContent);
+    highlight(tracking ? Math.min(position, words.length - 1) : -1);
+  }
+  function read(offset = position === 0 ? 0 : words[position]) {
+    // Give the voice enough context for natural phrasing. Only break between sentences.
+    let sentence = sentenceEnds.findIndex(end => end > offset);
+    while (sentenceEnds[sentence + 1] - offset <= 180) sentence++;
+    const endOffset = sentenceEnds[sentence] ?? text.length;
+    let end = position;
+    while (end < words.length && words[end] < endOffset) end++;
+    const phrase = new SpeechSynthesisUtterance(text.slice(offset, endOffset));
+    phrase.lang = language === 'en' ? 'en-US' : language;
+    phrase.rate = questionRate;
+    utterance = phrase;
+    phrase.onboundary = event => {
+      if (utterance !== phrase || event.name !== 'word') return;
+      while (position + 1 < end && words[position + 1] <= offset + event.charIndex) position++;
+      update();
+    };
+    phrase.onend = () => {
+      if (utterance !== phrase) return;
+      position = end;
+      if (endOffset < text.length && end < words.length && element.isConnected) { update(); read(endOffset); }
+      else stopSpeech();
+    };
+    phrase.onerror = event => {
+      if (utterance !== phrase) return;
+      stopSpeech();
+      if (!['interrupted', 'canceled'].includes(event.error)) progress.textContent = '即時朗讀暫時無法播放';
+    };
+    window.speechSynthesis.speak(phrase);
+  }
+  function start() {
+    if (!window.speechSynthesis) { progress.textContent = '瀏覽器未提供即時朗讀'; return; }
+    if (document.querySelector('.record.live,.record-feedback.live')) return;
+    stopSpeech();
+    activeQuestion = playback;
+    tracking = true;
+    element.dispatchEvent(new Event('questionplay', { bubbles: true }));
+    update();
+    read();
+  }
+  play.onclick = () => {
+    if (activeQuestion === playback) { stopSpeech(); return; }
+    if (position === words.length) position = 0;
+    start();
+  };
+  seek.oninput = () => {
+    position = Number(seek.value);
+    tracking = true;
+    if (activeQuestion === playback) { resumeAfterSeek = true; stopSpeech(); }
+    update();
+  };
+  seek.onchange = () => {
+    if (resumeAfterSeek && position < words.length) start();
+    resumeAfterSeek = false;
+  };
+  const controls = { element, play, seek, progress, words, highlight,
+    applyRate(commit) {
+      if (commit && activeQuestion === playback && Math.abs(utterance.rate - questionRate) > 0.0001) start();
+    } };
+  element.addEventListener('questionrate', ({ detail }) => {
+    if (detail.source !== rate) rate.value = questionRate;
+    rateSlider.value = questionRate;
+    rateSlider.setAttribute('aria-valuetext', `${questionRate}×`);
+    controls.applyRate(detail.commit);
+  });
+  rateSlider.setAttribute('aria-valuetext', `${questionRate}×`);
+  element.append(play, seek, progress, speed);
+  update();
+  return controls;
+}
+
+function installQuestionAudio(controls, url, token) {
+  const { element, play, seek, progress, words, highlight } = controls;
+  const audio = document.createElement('audio');
+  audio.hidden = true;
+  audio.preload = 'metadata';
+  audio.dataset.playbackReady = 'true';
+  const playback = { element, pause: () => audio.pause() };
+  let scrubbing = false;
+  const time = seconds => `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+  function showPosition(position) {
+    const duration = Number.isFinite(audio.duration) ? audio.duration : 0;
+    seek.disabled = !duration;
+    seek.max = duration;
+    seek.value = position;
+    progress.textContent = `${time(position)} / ${time(duration)}`;
+    seek.setAttribute('aria-valuetext', progress.textContent);
+    highlight(duration ? Math.min(words.length - 1, Math.floor(position / duration * words.length)) : -1);
+  }
+  function showPlayback() {
+    play.textContent = audio.paused ? '▶' : 'Ⅱ';
+    play.setAttribute('aria-label', audio.paused ? '播放題目朗讀音檔' : '暫停題目朗讀音檔');
+  }
+  audio.onplay = () => {
+    if (activeQuestion === playback) return;
+    stopSpeech();
+    activeQuestion = playback;
+    element.dispatchEvent(new Event('questionplay', { bubbles: true }));
+    showPlayback();
+  };
+  audio.onpause = () => {
+    if (activeQuestion === playback && audio.paused) activeQuestion = null;
+    showPlayback();
+  };
+  audio.ontimeupdate = audio.ondurationchange = () => { if (!scrubbing) showPosition(audio.currentTime); };
+  audio.onerror = () => { progress.textContent = '無法播放朗讀音檔'; };
+  seek.step = 'any';
+  seek.setAttribute('aria-label', '題目朗讀音檔播放進度');
+  seek.oninput = () => { scrubbing = true; showPosition(Number(seek.value)); };
+  seek.onchange = () => { audio.currentTime = Number(seek.value); scrubbing = false; };
+  const note = document.createElement('small');
+  note.textContent = '音檔對應字詞為約略定位';
+  element.append(audio, note);
+  showPosition(0);
+  const playAudio = async () => {
+    if (!audio.paused) { audio.pause(); return; }
+    try { await audio.play(); }
+    catch (error) {
+      progress.textContent = error.name === 'NotAllowedError' ? '音檔已載入，請再按一次播放' : '無法播放朗讀音檔';
+    }
+  };
+  const install = source => {
+    audio.src = source;
+    audio.playbackRate = questionRate;
+    play.onclick = playAudio;
+    showPlayback();
+  };
+  if (activeQuestion?.element === element) stopSpeech();
+  controls.applyRate = () => { audio.playbackRate = questionRate; };
+  if (!token) { install(url); return; }
+  play.setAttribute('aria-label', '載入題目朗讀音檔');
+  progress.textContent = '播放後可拖曳進度';
+  play.onclick = async () => {
+    play.disabled = true;
     try {
       const response = await fetch(url, { headers: { 'X-Session-Token': token } });
       if (!response.ok) throw Error('無法載入題目朗讀音檔');
       const blob = await response.blob();
-      if (!read.isConnected) return;
+      if (!play.isConnected) return;
       const objectUrl = URL.createObjectURL(blob);
       audioPreviews.set(audio, objectUrl);
-      audio.src = objectUrl;
-      read.replaceWith(audio);
-      await audio.play().catch(() => {});
-    } catch (error) { read.disabled = false; read.title = error.message; }
+      install(objectUrl);
+      await playAudio();
+    } catch (error) { progress.textContent = error.message; }
+    finally { play.disabled = false; }
   };
 }
 
 export async function showVocabulary(root, request) {
-  root.textContent = '讀取單字庫…';
+  const view = document.createElement('section');
+  view.textContent = '讀取單字庫…';
+  root.replaceChildren(view);
   try {
     const { cards } = await request('/api/student/vocabulary');
-    root.replaceChildren();
-    if (!cards.length) { root.textContent = '尚無收藏的單字。'; return; }
-    for (const card of cards) {
+    if (!root.contains(view)) return;
+    view.innerHTML = `<div class="vocabulary-toolbar">
+      <label>搜尋單字<input type="search" placeholder="輸入部分拼寫，例如 ad" spellcheck="false"></label>
+      <label>排序<select>
+        <option value="recent">收藏日期：新到舊</option>
+        <option value="oldest">收藏日期：舊到新</option>
+        <option value="az">拼寫：A 到 Z</option>
+        <option value="za">拼寫：Z 到 A</option>
+        <option value="shortest">長度：短到長</option>
+        <option value="longest">長度：長到短</option>
+      </select></label>
+    </div><p class="vocabulary-results muted" role="status"></p><div class="vocabulary-list"></div>`;
+    const search = view.querySelector('input'), sort = view.querySelector('select');
+    const status = view.querySelector('.vocabulary-results'), list = view.querySelector('.vocabulary-list');
+    const collator = new Intl.Collator(['en', 'zh-TW'], { sensitivity: 'base', numeric: true });
+    const dateFormat = new Intl.DateTimeFormat('zh-TW', { dateStyle: 'medium', timeZone: 'Asia/Taipei' });
+    const normalize = value => value.normalize('NFKC').toLowerCase();
+    const entries = new Map(cards.map(card => {
+      const label = card.phrase || card.word || '';
+      const key = normalize(label);
+      const length = (key.match(/[\p{L}\p{N}]/gu) || []).length;
+      const saved = Date.parse(card.savedAt);
       const row = document.createElement('details');
       row.className = 'item';
       const title = document.createElement('summary');
-      title.textContent = card.phrase || card.word;
+      const word = document.createElement('span');
+      word.textContent = label;
+      const meta = document.createElement('small');
+      meta.className = 'muted vocabulary-meta';
+      meta.textContent = Number.isFinite(saved) ? `${dateFormat.format(saved)} · ${length} 字元` : `${length} 字元`;
+      title.append(word, meta);
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.className = 'secondary';
       remove.textContent = '移除收藏';
       remove.onclick = async () => {
+        remove.disabled = true;
         try {
           await request('/api/student/vocabulary?card=' + encodeURIComponent(card.id), { method: 'DELETE' });
-          row.remove();
-          if (!root.childElementCount) root.textContent = '尚無收藏的單字。';
-        } catch (error) { alert(error.message); }
+          entries.delete(card.id);
+          render();
+        } catch (error) { alert(error.message); remove.disabled = false; }
       };
       row.append(title, cardDetails(card), remove);
-      root.append(row);
+      return [card.id, { row, label, key, length, saved: Number.isFinite(saved) ? saved : 0 }];
+    }));
+    const comparators = {
+      recent: (a, b) => b.saved - a.saved,
+      oldest: (a, b) => a.saved - b.saved,
+      az: (a, b) => collator.compare(a.label, b.label),
+      za: (a, b) => collator.compare(b.label, a.label),
+      shortest: (a, b) => a.length - b.length,
+      longest: (a, b) => b.length - a.length,
+    };
+    function render() {
+      const query = normalize(search.value.trim());
+      const compare = comparators[sort.value] || comparators.recent;
+      const matched = Array.from(entries.values()).filter(entry => entry.key.includes(query))
+        .sort((a, b) => compare(a, b) || collator.compare(a.label, b.label) || b.saved - a.saved);
+      list.replaceChildren(...matched.map(entry => entry.row));
+      status.textContent = matched.length ? `顯示 ${matched.length} / ${entries.size} 筆收藏`
+        : entries.size ? '找不到相符的單字。' : '尚無收藏的單字。';
     }
-  } catch (error) { root.textContent = error.message; }
+    search.addEventListener('input', render);
+    sort.addEventListener('change', render);
+    render();
+  } catch (error) { view.textContent = error.message; }
 }
 
 export function enhanceQuestion(element, language = 'en', entry) {
@@ -255,22 +537,50 @@ export function enhanceQuestion(element, language = 'en', entry) {
   element.dataset.enhanced = 'true'; element.classList.add('notranslate'); element.setAttribute('translate','no');
   const text = element.textContent;
   element.replaceChildren();
-  const read = document.createElement('button'); read.className = 'question-read'; read.type = 'button'; read.textContent = '▶'; read.setAttribute('aria-label','朗讀題目'); read.onclick = () => { if (window.speechSynthesis?.speaking) stopSpeech(); else speak(text, language); };
-  element.append(read);
+  const segments = Array.from(new Intl.Segmenter(language, { granularity: 'word' }).segment(text)).filter(segment => segment.isWordLike);
+  const words = segments.length ? segments.map(segment => segment.index) : [0];
+  let marks = [], activeWord = -1;
+  function highlight(index) {
+    for (const mark of marks[activeWord] || []) mark.classList.remove('question-current-word');
+    activeWord = index;
+    for (const mark of marks[index] || []) mark.classList.add('question-current-word');
+  }
+  function wordSlice(start, end) {
+    const nodes = [];
+    let cursor = start;
+    for (let index = 0; index < segments.length; index++) {
+      const segment = segments[index];
+      if (segment.index >= end) break;
+      const left = Math.max(start, segment.index), right = Math.min(end, segment.index + segment.segment.length);
+      if (left >= right) continue;
+      if (cursor < left) nodes.push(document.createTextNode(text.slice(cursor, left)));
+      const span = document.createElement('span');
+      span.textContent = text.slice(left, right);
+      if (index === activeWord) span.classList.add('question-current-word');
+      (marks[index] ||= []).push(span);
+      nodes.push(span);
+      cursor = right;
+    }
+    if (cursor < end) nodes.push(document.createTextNode(text.slice(cursor, end)));
+    return nodes;
+  }
+  const player = questionPlayer(text, language, words, highlight);
+  element.append(player.element);
   if (entry?.questionId) {
-    element.append(document.createTextNode(text));
+    element.append(...wordSlice(0, text.length));
     learningRequest('/api/learning/context', learningContext(entry), entry.sessionToken).then(({ cards, audioUrl }) => {
       if (!element.isConnected) return;
-      const nodes = [read];
+      const nodes = [player.element];
       const entries = new Map();
       let offset = 0;
+      marks = [];
       for (const card of cards) {
         if (card.start < offset || text.slice(card.start, card.end) !== card.word) continue;
-        nodes.push(document.createTextNode(text.slice(offset, card.start)));
+        nodes.push(...wordSlice(offset, card.start));
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'question-word';
-        button.textContent = card.word;
+        button.append(...wordSlice(card.start, card.end));
         button.setAttribute('aria-haspopup', 'dialog');
         button.setAttribute('aria-expanded', 'false');
         button.onclick = () => {
@@ -281,7 +591,7 @@ export function enhanceQuestion(element, language = 'en', entry) {
         nodes.push(button);
         offset = card.end;
       }
-      nodes.push(document.createTextNode(text.slice(offset)));
+      nodes.push(...wordSlice(offset, text.length));
       element.replaceChildren(...nodes);
       if (entries.size) element.addEventListener('pointerup', () => {
         const selection = window.getSelection();
@@ -294,15 +604,18 @@ export function enhanceQuestion(element, language = 'en', entry) {
         if (card.word.toLocaleLowerCase().includes(selection.toString().trim().toLocaleLowerCase()))
           contextualCard(button, card, entry);
       });
-      if (audioUrl) installQuestionAudio(read, audioUrl, entry.sessionToken);
+      if (audioUrl) installQuestionAudio(player, audioUrl, entry.sessionToken);
     }).catch(() => {});
     return;
   }
-  for (const part of text.split(/([A-Za-z]+(?:['’-][A-Za-z]+)*)/)) {
-    if (language === 'en' && /^[A-Za-z]/.test(part)) {
-      const button = document.createElement('button'); button.type = 'button'; button.className = 'question-word'; button.textContent = part; button.setAttribute('aria-haspopup','dialog'); button.setAttribute('aria-expanded','false'); button.onclick = () => showWord(button); element.append(button);
-    } else element.append(document.createTextNode(part));
+  let offset = 0;
+  for (const match of language === 'en' ? text.matchAll(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g) : []) {
+    const end = match.index + match[0].length;
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'question-word'; button.append(...wordSlice(match.index, end)); button.setAttribute('aria-haspopup','dialog'); button.setAttribute('aria-expanded','false'); button.onclick = () => showWord(button);
+    element.append(...wordSlice(offset, match.index), button);
+    offset = end;
   }
+  element.append(...wordSlice(offset, text.length));
 }
 document.addEventListener('keydown', e => { if(e.key === 'Escape') closeWord(); });
 document.addEventListener('pointerdown', e => { if(popup && !popup.contains(e.target) && !selected?.contains(e.target)) closeWord(); });

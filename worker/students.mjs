@@ -10,6 +10,7 @@ const studentDeletionAllowed = `(?='super_admin' OR (
     WHERE r.student_id=s.id AND a.teacher_id IS NOT ?)
 ))`;
 const deletionBindings = t => [t.role, t.id, t.id, t.id, t.id];
+const maxAvatarBytes = 128 * 1024;
 
 export async function purgeStudentAudio(env, studentId = null) {
   const where = studentId ? 'WHERE student_id=?' : '';
@@ -29,11 +30,48 @@ export async function purgeStudentAudio(env, studentId = null) {
 export function studentServices(h) {
   const { response, fail, id, token, hash, passwordHash, cookie, teacher, bodyJson } = h;
   const authCookie = (value, secure, age=604800) => `student_session=${encodeURIComponent(value)}; Path=/; HttpOnly; ${secure ? 'Secure; ' : ''}SameSite=Lax; Max-Age=${age}`;
-  const publicStudent = s => ({ id:s.id, username:s.username, displayName:s.display_name, studentNumber:s.student_number, mustChangePassword:!!s.must_change_password });
+  const publicStudent = s => ({ id:s.id, username:s.username, displayName:s.display_name, studentNumber:s.student_number,
+    mustChangePassword:!!s.must_change_password, avatarUrl:s.has_avatar ? '/api/student/avatar' : null });
   async function student(req, env, allowInitial=false) {
     const raw = cookie(req, 'student_session'); if (!raw) return null;
-    const s = await env.DB.prepare('SELECT s.* FROM student_logins l JOIN students s ON s.id=l.student_id WHERE l.token_hash=? AND l.expires_at>? AND s.disabled_at IS NULL').bind(await hash(raw), new Date().toISOString()).first();
+    const s = await env.DB.prepare(`SELECT s.*,EXISTS(SELECT 1 FROM student_avatars sa WHERE sa.student_id=s.id) has_avatar
+      FROM student_logins l JOIN students s ON s.id=l.student_id WHERE l.token_hash=? AND l.expires_at>? AND s.disabled_at IS NULL`)
+      .bind(await hash(raw), new Date().toISOString()).first();
     return s && (allowInitial || !s.must_change_password) ? s : null;
+  }
+  async function avatar(req, env, studentId) {
+    if (req.method === 'GET') {
+      const row = await env.DB.prepare('SELECT image FROM student_avatars WHERE student_id=?').bind(studentId).first();
+      return row ? new Response(new Uint8Array(row.image), { headers: {
+        'Content-Type': 'image/jpeg', 'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff', 'Cross-Origin-Resource-Policy': 'same-origin',
+      } }) : fail('尚未設定頭像', 404);
+    }
+    if (req.method === 'DELETE') {
+      await env.DB.prepare('DELETE FROM student_avatars WHERE student_id=?').bind(studentId).run();
+      return response({ avatarUrl: null });
+    }
+    if (req.method !== 'PUT') return fail('不支援此操作', 405);
+    if (req.headers.get('Content-Type') !== 'image/jpeg' || !req.body) return fail('請上傳 JPEG 頭像', 415);
+    if (Number(req.headers.get('Content-Length')) > maxAvatarBytes) return fail('頭像大小不能超過 128 KB', 413);
+    const reader = req.body.getReader(), image = new Uint8Array(maxAvatarBytes);
+    let size = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (size + value.length > image.length) {
+        await reader.cancel();
+        return fail('頭像大小不能超過 128 KB', 413);
+      }
+      image.set(value, size);
+      size += value.length;
+    }
+    if (size < 4 || image[0] !== 0xff || image[1] !== 0xd8 || image[2] !== 0xff || image[size - 2] !== 0xff || image[size - 1] !== 0xd9)
+      return fail('無法辨識頭像，請重新選擇圖片');
+    const saved = await env.DB.prepare(`INSERT INTO student_avatars(student_id,image)
+      SELECT id,? FROM students WHERE id=?
+      ON CONFLICT(student_id) DO UPDATE SET image=excluded.image`).bind(image.slice(0, size).buffer, studentId).run();
+    return saved.meta.changes ? response({ avatarUrl: new URL(req.url).pathname }) : fail('找不到學生帳號', 404);
   }
   async function routes(req, env, url) {
     const path = url.pathname;
@@ -42,7 +80,8 @@ export function studentServices(h) {
       const key = await hash(`${req.headers.get('cf-connecting-ip') || 'local'}:${username.toLowerCase()}`);
       const limit = await env.DB.prepare('SELECT * FROM student_login_limits WHERE key=?').bind(key).first();
       if (limit && limit.reset_at > Date.now() && limit.failures >= 8) return fail('登入嘗試過多，請 15 分鐘後重試',429);
-      const s = await env.DB.prepare('SELECT * FROM students WHERE username=?').bind(username).first();
+      const s = await env.DB.prepare(`SELECT s.*,EXISTS(SELECT 1 FROM student_avatars sa WHERE sa.student_id=s.id) has_avatar
+        FROM students s WHERE username=?`).bind(username).first();
       if (!s || s.disabled_at || await passwordHash(String(b.password || '').slice(0,256), s.password_salt) !== s.password_hash) {
         await env.DB.prepare('INSERT INTO student_login_limits(key,failures,reset_at) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET failures=CASE WHEN reset_at<=? THEN 1 ELSE failures+1 END,reset_at=CASE WHEN reset_at<=? THEN excluded.reset_at ELSE reset_at END').bind(key,Date.now()+900000,Date.now(),Date.now()).run();
         return fail('帳號或密碼錯誤，或帳號已停用',401);
@@ -60,6 +99,10 @@ export function studentServices(h) {
     if(path === '/api/student/me' && req.method === 'GET') {
       const s = await student(req,env,true); return s ? response({student:publicStudent(s)}) : fail('請先登入學生帳號',401);
     }
+    if (path === '/api/student/avatar') {
+      const s = await student(req, env);
+      return s ? avatar(req, env, s.id) : fail('請先登入學生帳號', 401);
+    }
     if(path === '/api/student/password' && req.method === 'POST') {
       const s = await student(req,env,true); if(!s) return fail('請先登入',401);
       const b=await bodyJson(req), password=String(b.password || '');
@@ -74,11 +117,26 @@ export function studentServices(h) {
       ]);
       return response({ok:true},200,{'set-cookie':authCookie(value,url.protocol==='https:')});
     }
-    if(!path.startsWith('/api/teacher/students')) return null;
+    const stageAvatar = /^\/api\/teacher\/session-avatar\/([^/]+)$/.exec(path);
+    if(!path.startsWith('/api/teacher/students') && !stageAvatar) return null;
     const t=await teacher(req,env); if(!t) return fail('請先登入教師帳號',401);
+    if (stageAvatar && req.method === 'GET') {
+      const row = await env.DB.prepare(`SELECT s.student_account_id FROM sessions s JOIN assignments a ON a.id=s.assignment_id
+        WHERE s.id=? AND s.student_account_id IS NOT NULL AND s.anonymous_id IS NULL AND a.anonymous=0 AND a.identity_mode<>'anonymous'
+          AND s.deleted_at IS NULL AND a.deleted_at IS NULL AND (a.teacher_id=? OR ?='super_admin')`)
+        .bind(stageAvatar[1], t.id, t.role).first();
+      return row ? avatar(req, env, row.student_account_id) : fail('找不到頭像', 404);
+    }
+    const managedAvatar = /^\/api\/teacher\/students\/([^/]+)\/avatar$/.exec(path);
+    if (managedAvatar) {
+      const s = await env.DB.prepare(`SELECT s.id FROM students s WHERE s.id=? AND ${managedStudent}`)
+        .bind(managedAvatar[1], t.role, t.id).first();
+      return s ? avatar(req, env, s.id) : fail('找不到學生帳號', 404);
+    }
     if(path === '/api/teacher/students' && req.method === 'GET') {
       const rows = await env.DB.prepare(`SELECT s.id,s.username,s.display_name,s.student_number,s.disabled_at,s.must_change_password,
-        ${studentDeletionAllowed} can_delete FROM students s WHERE ${managedStudent} ORDER BY s.created_at DESC`)
+        ${studentDeletionAllowed} can_delete, EXISTS(SELECT 1 FROM student_avatars sa WHERE sa.student_id=s.id) has_avatar
+        FROM students s WHERE ${managedStudent} ORDER BY s.created_at DESC`)
         .bind(...deletionBindings(t), t.role, t.id).all();
       return response({students:rows.results});
     }

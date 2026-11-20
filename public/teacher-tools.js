@@ -88,6 +88,10 @@ export function questionsEditor(root, request, esc, assignment, isPublished) {
   if (assignment?.sentences.length) assignment.sentences.forEach(add);
   else add();
   return {
+    replaceWithText(texts) {
+      questions.replaceChildren();
+      texts.forEach(text => add({ text }));
+    },
     read: () => [...questions.children].map(card => ({
       id: card.dataset.id || undefined,
       text: card.querySelector('.qtext').value, pinyin: card.querySelector('.qpinyin').value,
@@ -142,6 +146,56 @@ export function assignmentsPicker(form, request, esc, initial = [], assignmentId
   return () => form.elements.identityMode.value === 'anonymous' ? [] : [...selected];
 }
 
+export function assignmentSplitter(form, request, editor) {
+  const box = document.createElement('fieldset');
+  box.className = 'assignment-settings';
+  box.innerHTML = `<legend>AI 分題</legend>
+    <label>原文<textarea class="split-source notranslate" translate="no" rows="5" maxlength="12000" placeholder="貼上要分成多題的朗讀原文"></textarea></label>
+    <div class="row">
+      <label>要切成幾題（1–30）<input class="split-count" type="text" inputmode="numeric" maxlength="2" value="4"></label>
+      <label>特殊需求（選填）<textarea class="split-requirements" rows="2" maxlength="1500" placeholder="例如：保留對話段落，或讓各題長度接近"></textarea></label>
+    </div>
+    <button type="button" class="secondary split-run">AI 分題並帶入題目</button>
+    <small>分題會使用你的 Gemini 設定與專案配額。</small>
+    <p class="split-status" role="status"></p>`;
+  const questionArea = form.querySelector('.question-editor');
+  questionArea.before(box);
+  const publish = form.querySelector('button:not([type])');
+  const source = box.querySelector('.split-source');
+  const countField = box.querySelector('.split-count');
+  const requirements = box.querySelector('.split-requirements');
+  const status = box.querySelector('.split-status');
+  const run = box.querySelector('.split-run');
+  let busy = false;
+  run.onclick = async () => {
+    if (busy || publish.disabled) return;
+    const text = source.value.trim();
+    const count = Number(countField.value.trim());
+    if (!text) { status.textContent = '請貼上原文。'; source.focus(); return; }
+    if (!/^\d{1,2}$/.test(countField.value.trim()) || count < 1 || count > 30) {
+      status.textContent = '請輸入 1–30 題。'; countField.focus(); return;
+    }
+    const hasContent = editor.read().some(q => q.text.trim() || q.pinyin.trim() || q.maxAttempts !== null || q.recordingSeconds !== null)
+      || editor.files().some(Boolean);
+    if (hasContent && !confirm('分題成功後會取代目前的題目、發音提示、各題錄音設定和已選音檔。確定繼續？')) return;
+    busy = box.disabled = publish.disabled = questionArea.inert = true;
+    status.textContent = '正在分題…';
+    try {
+      const { questions } = await request('/api/teacher/assignments/split', {
+        method: 'POST', ...json({ text, count, requirements: requirements.value, language: form.elements.language.value }),
+      });
+      if (!form.isConnected) return;
+      editor.replaceWithText(questions);
+      status.textContent = `已帶入 ${questions.length} 題，可在下方確認或修改。`;
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      busy = box.disabled = publish.disabled = questionArea.inert = false;
+    }
+  };
+  return () => busy;
+}
+
 export async function individualAssignments(app, request, esc, back) {
   app.innerHTML = '<section class="panel wide"><button type="button" class="secondary">返回教師工作台</button><h2>學生個別作業區</h2><div class="student-folders">讀取中…</div></section>';
   app.querySelector('button').onclick = back;
@@ -154,26 +208,43 @@ export async function individualAssignments(app, request, esc, back) {
 
 export async function editGemini(app, request, back) {
   app.innerHTML = `<section class="panel"><button type="button" class="secondary">返回教師工作台</button><h2>我的 Gemini 設定</h2>
-    <form><label>模型 ID<input name="model" required placeholder="gemini-…"></label><label>推理程度<input name="effort" placeholder="default、low、high 或模型的 token 預算"></label>
+    <form><label>模型 ID<input name="model" placeholder="留空使用預設模型" autocapitalize="none" spellcheck="false"></label><label>推理程度<input name="effort" placeholder="default、low、high 或模型的 token 預算"></label>
     <label>新的 Gemini API Key<input name="apiKey" type="password" autocomplete="off" spellcheck="false" maxlength="256"></label>
-    <label class="check"><input name="clearKey" type="checkbox">移除已儲存的金鑰</label><p class="key-state"></p><p role="status"></p><button>儲存</button></form></section>`;
+    <label class="check"><input name="clearKey" type="checkbox">移除已儲存的金鑰</label><p class="key-state"></p><p role="status"></p><div class="actions"><button type="submit">儲存</button><button type="button" class="secondary check-gemini">驗證金鑰與模型</button></div></form></section>`;
   app.querySelector('button').onclick = back;
   const form = app.querySelector('form'), status = form.querySelector('[role=status]');
-  const update = settings => { form.querySelector('.key-state').textContent = settings.configured ? '已設定金鑰。欄位留空時保留現有金鑰。' : '尚未設定金鑰。'; };
-  try {
-    const settings = await request('/api/teacher/gemini');
+  const save = form.querySelector('[type=submit]'), check = form.querySelector('.check-gemini');
+  const busy = value => { save.disabled = check.disabled = value; };
+  const update = settings => {
+    form.querySelector('.key-state').textContent = settings.configured ? '已設定金鑰。欄位留空時保留現有金鑰。' : '尚未設定金鑰。';
     form.elements.model.value = settings.model;
     form.elements.effort.value = settings.effort;
-    update(settings);
+  };
+  busy(true);
+  try {
+    update(await request('/api/teacher/gemini'));
   } catch (error) { status.textContent = error.message; }
+  finally { busy(false); }
   form.onsubmit = async event => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(form));
-    form.elements.apiKey.value = '';
+    busy(true);
     try {
       update(await request('/api/teacher/gemini', { method: 'PUT', ...json({ ...data, clearKey: data.clearKey === 'on' }) }));
+      if (form.elements.apiKey.value === data.apiKey) form.elements.apiKey.value = '';
       form.elements.clearKey.checked = false;
       status.textContent = '已儲存';
     } catch (error) { status.textContent = error.message; }
+    finally { busy(false); }
+  };
+  check.onclick = async () => {
+    const data = Object.fromEntries(new FormData(form));
+    busy(true);
+    status.textContent = '正在向 Google 查詢模型…';
+    try {
+      const result = await request('/api/teacher/gemini/check', { method: 'POST', ...json(data) });
+      status.textContent = `金鑰可查詢 ${result.model} 的模型資訊。正式生成仍取決於 Google 專案權限與配額。`;
+    } catch (error) { status.textContent = error.message; }
+    finally { busy(false); }
   };
 }

@@ -10,7 +10,7 @@ import { prepareRecording, MAX_RECORDING_SECONDS } from './recording.js';
 import { VOICE_PROFILES, VOICE_TRANSFORM_VERSION } from "./voice-profiles.js";
 import { openClassroom } from "./classroom.js";
 import { openLocalPractice } from "./local-practice.js";
-import { limitsEditor, questionsEditor, assignmentsPicker, individualAssignments, editGemini } from "./teacher-tools.js";
+import { limitsEditor, questionsEditor, assignmentsPicker, assignmentSplitter, individualAssignments, editGemini } from "./teacher-tools.js";
 
 const app = document.querySelector("#app");
 const state = {
@@ -784,9 +784,11 @@ function teacherCreate(source) {
   const limits = limitsEditor(form, source);
   const pick = assignmentsPicker(form, request, esc);
   const editor = questionsEditor(form, request, esc, source, false);
+  const splitting = assignmentSplitter(form, request, editor);
   const creationKey = crypto.randomUUID();
   form.onsubmit = async (event) => {
     event.preventDefault();
+    if (splitting()) return;
     const button = form.querySelector('button:not([type])');
     button.disabled = true;
     const f = new FormData(form);
@@ -884,24 +886,56 @@ async function teacherDetail(id, notice = "") {
     const generate = document.createElement("button");
     generate.type = "button";
     generate.className = "secondary";
-    generate.textContent = isDraft ? "生成語塊並發布" : "補建語塊卡";
+    generate.textContent = isDraft ? "生成語塊並發布" : a.vocabularyReady ? "重新生成語塊卡" : "補建語塊卡";
     generate.disabled = a.vocabularyGenerating;
-    generate.hidden = !ownAssignment || a.vocabularyReady;
+    generate.hidden = !ownAssignment;
     const generationStatus = document.createElement("span");
     generationStatus.setAttribute("role", "status");
-    generationStatus.textContent = a.vocabularyGenerating ? "正在生成語塊卡，請稍後重新整理。" : a.vocabularyError || "";
+    const backgroundMessage = "正在背景生成語塊卡，可以離開此頁。";
+    const vocabularyPath = "/api/teacher/assignments/" + encodeURIComponent(id) + "/vocabulary";
+    generationStatus.textContent = a.vocabularyGenerating ? backgroundMessage : a.vocabularyError || (a.vocabularyReady ? "語塊卡已就緒。" : "");
+    function watchVocabulary() {
+      setTimeout(async () => {
+        if (!detail.isConnected) return;
+        try {
+          const status = await request(vocabularyPath);
+          if (!detail.isConnected) return;
+          if (status.generating) { watchVocabulary(); return; }
+          generate.disabled = false;
+          if (status.error) { generationStatus.textContent = status.error; return; }
+          if (isDraft && status.published) { await teacherDetail(id, "作業已發布"); return; }
+          if (status.revision === a.revision + 1) a.revision = status.revision;
+          if (status.ready) {
+            a.vocabularyReady = true;
+            generate.textContent = "重新生成語塊卡";
+          }
+          generationStatus.textContent = "語塊卡已更新。";
+        } catch (error) {
+          if (!detail.isConnected) return;
+          generationStatus.textContent = "暫時無法查詢語塊進度。";
+          if (error.status !== 401 && error.status !== 404) watchVocabulary();
+          else generate.disabled = false;
+        }
+      }, 3000);
+    }
+    if (ownAssignment && a.vocabularyGenerating) watchVocabulary();
     generate.onclick = async () => {
-      if (!confirm("將已儲存的整份題目送給 Gemini，使用你的專案配額？")) return;
+      const message = !isDraft && a.vocabularyReady
+        ? "將整份題目送給 Gemini 並使用你的專案配額。新版會取代目前的語塊卡（含手動修改）。已開始的作答及已收藏的卡片保留原版。"
+        : "將已儲存的整份題目送給 Gemini，使用你的專案配額？";
+      if (!confirm(message)) return;
       generate.disabled = true;
-      generationStatus.textContent = "生成中…";
+      generationStatus.textContent = "正在送出生成工作…";
       try {
-        const action = isDraft ? "/publish" : "/vocabulary";
-        const result = await request("/api/teacher/assignments/" + a.id + action, { method: "POST" });
+        const url = isDraft ? "/api/teacher/assignments/" + encodeURIComponent(id) + "/publish" : vocabularyPath;
+        const result = await request(url, { method: "POST" });
         if (!detail.isConnected) return;
         if (result.published) await teacherDetail(id, isDraft ? "作業已發布" : "語塊卡已建立");
-        else generationStatus.textContent = "已在生成，請稍後重新整理。";
-      } catch (error) { generationStatus.textContent = error.message; }
-      finally { generate.disabled = false; }
+        else {
+          generationStatus.textContent = backgroundMessage;
+          watchVocabulary();
+        }
+      } catch (error) { generationStatus.textContent = error.message; generate.disabled = false; }
     };
     const actions = document.createElement("div");
     actions.className = "actions";

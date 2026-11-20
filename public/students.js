@@ -1,4 +1,5 @@
 import { showVocabulary } from './learning.js';
+import { editAvatar, setAvatar } from './avatars.js';
 
 export async function studentPortal(app, request, esc, join, history) {
   let account;
@@ -10,7 +11,13 @@ export async function studentPortal(app, request, esc, join, history) {
     return;
   }
   if(account.mustChangePassword) { passwordForm(app,request,()=>studentPortal(app,request,esc,join,history)); return; }
-  app.innerHTML=`<section class="panel wide student-dashboard"><div class="row"><div><h2>我的作業</h2><p>${esc(account.displayName)}｜${esc(account.username)}</p></div><div class="actions"><button id="joinAssignment">輸入作業代碼</button><button id="changePassword" class="secondary">修改密碼</button><button id="studentLogout" class="secondary">登出</button></div></div><div id="studentHistory"></div></section>`;
+  app.innerHTML=`<section class="panel wide student-dashboard"><div class="row"><div><h2>我的作業</h2><div class="student-profile"><span class="profile-avatar" aria-hidden="true"></span><p>${esc(account.displayName)}｜${esc(account.username)}</p></div></div><div class="actions"><button id="joinAssignment">輸入作業代碼</button><button id="studentAvatar" class="secondary">設定頭像</button><button id="changePassword" class="secondary">修改密碼</button><button id="studentLogout" class="secondary">登出</button></div></div><div id="studentHistory"></div></section>`;
+  const profileAvatar = app.querySelector('.profile-avatar');
+  setAvatar(profileAvatar, account.avatarUrl);
+  app.querySelector('#studentAvatar').onclick = () => editAvatar(app, '/api/student/avatar', account.avatarUrl, url => {
+    account.avatarUrl = url;
+    setAvatar(profileAvatar, url);
+  });
   app.querySelector('#joinAssignment').onclick=()=>join(false,account);
   app.querySelector('#changePassword').onclick=()=>passwordForm(app,request,()=>studentPortal(app,request,esc,join,history));
   app.querySelector('#studentLogout').onclick=async()=>{await request('/api/student/logout',{method:'POST'}); studentPortal(app,request,esc,join,history);};
@@ -48,7 +55,7 @@ function confirmStudentDeletion(root, student, request, done) {
   dialog.innerHTML = `<form>
     <h3 id="student-delete-title">永久刪除學生帳號</h3>
     <p class="student-delete-name"></p>
-    <p>帳號、與帳號關聯的作答、口說錄音、錄音評語和單字收藏將永久刪除，無法復原。</p>
+    <p>帳號、頭像、與帳號關聯的作答、口說錄音、錄音評語和單字收藏將永久刪除，無法復原。</p>
     <label>請輸入上方的學生帳號以確認
       <input name="confirmUsername" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required>
     </label>
@@ -99,6 +106,21 @@ export async function manageStudents(app,request,esc,back) {
     list.before(result);
     list.innerHTML=data.students.map(s=>`<details class="item"><summary>${esc(s.display_name)}｜${esc(s.username)} — ${s.disabled_at?'已停用':s.must_change_password?'待首次修改密碼':'使用中'}</summary><form class="resetStudent" data-id="${esc(s.id)}"><label>重設臨時密碼<input name="password" type="password" required minlength="8" maxlength="128" autocomplete="new-password"></label><button>重設密碼</button></form><div class="actions"><button type="button" class="secondary toggleStudent" data-id="${esc(s.id)}" data-disabled="${!s.disabled_at}">${s.disabled_at?'啟用':'停用'}帳號</button>${s.can_delete ? `<button type="button" class="danger deleteStudent" data-id="${esc(s.id)}">刪除帳號與口說錄音</button>` : '<small>帳號若涉及其他教師，請由最高管理員刪除。</small>'}</div></details>`).join('') || '<p>尚未建立學生帳號。</p>';
     const students = new Map(data.students.map(student => [student.id, student]));
+    list.querySelectorAll('.resetStudent').forEach(form => {
+      const student = students.get(form.dataset.id);
+      const path = `/api/teacher/students/${encodeURIComponent(student.id)}/avatar`;
+      let current = student.has_avatar ? path : null;
+      const profile = document.createElement('div');
+      profile.className = 'student-profile';
+      profile.innerHTML = '<span class="profile-avatar" aria-hidden="true"></span><button type="button" class="secondary">設定頭像</button>';
+      const photo = profile.querySelector('.profile-avatar');
+      setAvatar(photo, current);
+      profile.querySelector('button').onclick = () => editAvatar(app, path, current, url => {
+        current = url;
+        setAvatar(photo, url);
+      });
+      form.before(profile);
+    });
     list.querySelectorAll('.deleteStudent').forEach(button => button.onclick = () => {
       const student = students.get(button.dataset.id);
       confirmStudentDeletion(app, student, request, audioPending => {

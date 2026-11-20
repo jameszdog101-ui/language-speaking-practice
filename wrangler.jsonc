@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "mandarin-speaking-practice",
-  "main": "worker/index.mjs",
+  "main": "worker/entry.mjs",
   "compatibility_date": "2026-10-13",
   "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
   "d1_databases": [{
@@ -17,10 +17,12 @@
   }],
   "vars": { "APP_ENV": "production", "OWNER_EMAIL": "jameszdog101@gmail.com" },
   "triggers": { "crons": ["17 3 * * *"] },
+  "workflows": [{ "name": "speaking-practice-vocabulary", "binding": "VOCABULARY_WORKFLOW", "class_name": "VocabularyWorkflow" }],
   "env": {
     "staging": {
       "name": "mandarin-speaking-practice-staging",
       "triggers": { "crons": ["17 3 * * *"] },
+      "workflows": [{ "name": "speaking-practice-staging-vocabulary", "binding": "VOCABULARY_WORKFLOW", "class_name": "VocabularyWorkflow" }],
       "d1_databases": [{
         "binding": "DB",
         "database_name": "mandarin-speaking-practice-staging",
@@ -38,6 +40,7 @@
       "name": "language-speaking-practice",
       "workers_dev": true,
       "triggers": { "crons": ["17 3 * * *"] },
+      "workflows": [{ "name": "language-speaking-practice-vocabulary", "binding": "VOCABULARY_WORKFLOW", "class_name": "VocabularyWorkflow" }],
       "d1_databases": [{
         "binding": "DB",
         "database_name": "mandarin-speaking-practice-feature-staging",

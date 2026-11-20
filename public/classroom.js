@@ -1,5 +1,6 @@
 import { playableSource } from './playback.js';
-import { enhanceQuestion } from './learning.js';
+import { enhanceQuestion, stopSpeech } from './learning.js';
+import { setAvatar } from './avatars.js';
 const escape = (value = "") => String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const submissionTime = new Intl.DateTimeFormat('zh-TW', {
   dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Taipei',
@@ -51,6 +52,12 @@ export function openClassroom(app, { preview, id, request }) {
       else stop();
       return;
     }
+    stopSpeech();
+    const status = card.querySelector('.voice-status');
+    if (status.classList.contains('has-error')) {
+      status.classList.remove('has-error');
+      status.textContent = '已採用錄音';
+    }
     if (active !== card) {
       stop();
       active = card;
@@ -84,7 +91,9 @@ export function openClassroom(app, { preview, id, request }) {
       const blocked = error.name === 'NotAllowedError';
       if (blocked) pause();
       else stop();
-      card.querySelector('.voice-status').textContent = blocked ? '錄音已載入，請再按一次播放' : '無法播放，請重試或重新登入';
+      status.textContent = blocked ? '錄音已載入，請再按一次播放' : '無法播放，請重試或重新登入';
+      status.classList.add('has-error');
+      card.place();
     }
   }
   function draw() {
@@ -93,6 +102,10 @@ export function openClassroom(app, { preview, id, request }) {
     const rows = data.sessions.filter(s => s.answers.some(a => a.sentenceId === q?.id && a.audioUrl));
     app.innerHTML = `<section class="classroom"><div class="classroom-top"><a href="#teacher" class="classroom-back">← 教師工作台</a><span class="live-label"><i></i> CLASSROOM LIVE</span><span>${preview ? '示意模式 · 虛構學生資料' : '上課互動式演示'}</span></div><div class="classroom-heading"><div><div class="eyebrow">LISTEN. MOVE. DISCOVER.</div><h1>${escape(data.assignment.title)}</h1><p>讓每個聲音，都有被聽見的位置。</p></div><div class="classroom-tools"><button class="secondary" id="refreshBoard" ${preview ? 'disabled title="示意模式沒有即時錄音"' : ''}>↻ 更新錄音</button><button class="secondary" id="resetBoard">↺ 重新排列</button><button class="secondary" id="fullscreen">⛶ 全螢幕</button></div></div><div class="classroom-refresh-status" role="status" aria-live="polite"></div><div class="question-panel"><span class="question-number">${String(index + 1).padStart(2, '0')}</span><div><span class="question-caption">本題朗讀 · ${rows.length} 份錄音</span><h2>${escape(q?.text || '尚無題目')}</h2><p>${escape(q?.pinyin || '')}</p></div><span class="question-mark">“</span></div><div class="stage-label"><span>✦ 聲音舞台 <small>拖曳卡片，自由安排你的課堂</small></span><span>${preview ? '播放為進度模擬，無學生音訊' : data.assignment.deidentifyVoice ? '播放聲音去識別化錄音' : '點擊 ▶ 聆聽'}</span></div><div class="voice-stage" aria-label="可拖曳的學生錄音舞台"></div><div class="classroom-bottom"><span>◉ 位置僅保留於本次演示</span><div class="question-nav"><button id="questionPrev" class="secondary" ${index === 0 ? 'disabled' : ''}>← 上一題</button><span>${index + 1} <small>/ ${data.assignment.sentences.length}</small></span><button id="questionNext" ${index >= data.assignment.sentences.length - 1 ? 'disabled' : ''}>下一題 →</button></div><span>← → 切換題目</span></div></section>`;
     app.append(audio);
+    app.querySelector('.question-panel').addEventListener('questionplay', () => {
+      if (source || preview) pause();
+      else stop();
+    });
     const back = app.querySelector('.classroom-back');
     back.href = backUrl;
     back.textContent = `← ${backLabel}`;
@@ -108,9 +121,8 @@ export function openClassroom(app, { preview, id, request }) {
     app.querySelector('.question-panel p').classList.add('notranslate');
     app.querySelector('.question-panel p').setAttribute('translate', 'no');
     const stage = app.querySelector('.voice-stage');
-    const columns = Math.max(1, Math.floor(stage.clientWidth / 265));
-    const rowHeight = 295;
-    stage.style.height = `${Math.max(490, Math.ceil(rows.length / columns) * rowHeight + 45)}px`;
+    const gap = 12;
+    let columns, rowHeight, columnWidth;
     if (!rows.length) stage.innerHTML = '<div class="stage-empty">還沒有可播放的錄音<p>學生採用本題錄音後，就會出現在這裡。</p></div>';
     if (!positions.has(q?.id)) positions.set(q?.id, new Map());
     const layout = positions.get(q?.id);
@@ -118,8 +130,10 @@ export function openClassroom(app, { preview, id, request }) {
       const card = document.createElement('article');
       card.className = `voice-card tone-${i % 4}`;
       card.style.setProperty('--delay', `${-i * .7}s`);
-      card.innerHTML = `<div class="voice-card-inner"><div class="voice-card-top"><span class="avatar">${escape((s.name || s.anonymousId || '?').slice(-2))}</span><div><b>${escape(s.name || s.anonymousId)}</b><small>${escape(s.studentId || (s.completedAt ? '已完成作答' : '作答中'))}</small></div><button class="drag-handle" aria-label="拖曳或使用方向鍵移動 ${escape(s.name || s.anonymousId)}">⠿</button></div><div class="voice-player"><button class="play" aria-label="播放 ${escape(s.name || s.anonymousId)} 的錄音">▶</button><div class="voice-wave" aria-hidden="true">${Array.from({length:24}, (_, j) => `<i style="height:${10 + ((j * 13 + i * 7) % 29)}px"></i>`).join('')}</div><span class="voice-time">${preview ? '0:08' : '錄音'}</span></div><div class="voice-status" aria-live="polite">${preview ? '示意錄音' : '已採用錄音'} <span>↗ 拖曳排列</span></div></div>`;
+      card.innerHTML = `<div class="voice-card-inner"><div class="voice-card-top"><span class="avatar profile-avatar" aria-hidden="true"></span><div><b>${escape(s.name || s.anonymousId)}</b><small>${escape(s.studentId || (s.completedAt ? '已完成作答' : '作答中'))}</small></div><button class="drag-handle" aria-label="拖曳或使用方向鍵移動 ${escape(s.name || s.anonymousId)}">⠿</button></div><div class="voice-player"><button class="play" aria-label="播放 ${escape(s.name || s.anonymousId)} 的錄音">▶</button><div class="voice-wave" aria-hidden="true">${Array.from({length:24}, (_, j) => `<i style="height:${10 + ((j * 13 + i * 7) % 29)}px"></i>`).join('')}</div><span class="voice-time">${preview ? '0:08' : '錄音'}</span></div><div class="voice-status" aria-live="polite">${preview ? '示意錄音' : '已採用錄音'} <span>↗ 拖曳排列</span></div></div>`;
+      setAvatar(card.querySelector('.profile-avatar'), s.avatarUrl);
       stage.append(card);
+      card.querySelector('.voice-card-top b').title = s.name || s.anonymousId || '';
       const answer = s.answers.find(a => a.sentenceId === q.id);
       if (answer.text && answer.text !== q.text) {
         const oldText = document.createElement('p');
@@ -156,14 +170,13 @@ export function openClassroom(app, { preview, id, request }) {
         if (!preview && active === card && audio.readyState >= 1) audio.currentTime = card.playhead;
         card.updateProgress();
       };
-      if (!layout.has(s.id)) layout.set(s.id, { x: 20 + (i % columns) * ((stage.clientWidth - 35) / columns) + (i % 2) * 6, y: 24 + Math.floor(i / columns) * rowHeight + (i % 3) * 7 });
       const place = () => {
         const p = layout.get(s.id);
         p.x = Math.max(0, Math.min(p.x, stage.clientWidth - card.offsetWidth));
         p.y = Math.max(0, Math.min(p.y, stage.clientHeight - card.offsetHeight - 8));
         card.style.left = `${p.x}px`; card.style.top = `${p.y}px`;
       };
-      card.place = place; place();
+      card.place = place;
       const controls = document.createElement('div');
       controls.className = 'voice-options';
       controls.innerHTML = '<label>速度 <select aria-label="錄音播放速度"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button type="button" class="secondary" aria-pressed="false">放大</button>';
@@ -180,6 +193,16 @@ export function openClassroom(app, { preview, id, request }) {
         card.style.zIndex = ++z;
         place();
       };
+      if (i === 0) {
+        columnWidth = card.offsetWidth + gap;
+        rowHeight = card.offsetHeight + gap;
+        columns = Math.max(1, Math.floor((stage.clientWidth - gap) / columnWidth));
+        stage.style.height = `${Math.max(400, Math.ceil(rows.length / columns) * rowHeight + gap)}px`;
+      }
+      if (!layout.has(s.id)) layout.set(s.id, {
+        x: gap + (i % columns) * columnWidth,
+        y: gap + Math.floor(i / columns) * rowHeight,
+      });
       place();
       const handle = card.querySelector('.drag-handle');
       let drag;

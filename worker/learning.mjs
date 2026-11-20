@@ -1,5 +1,5 @@
 import { audioResponse } from './audio.mjs';
-import { geminiSettings, generateVocabulary } from './gemini.mjs';
+import { geminiSettings, generateVocabulary, hasChineseTranslation, readWordFamily, validVerbForms } from './gemini.mjs';
 
 const audioTypes = new Set(['audio/wav', 'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/webm', 'audio/aac']);
 const maxAudioBytes = 15 * 1024 * 1024;
@@ -51,11 +51,11 @@ export async function cardWrites(env, hash, assignment, output) {
   return { statements, count };
 }
 
-export async function claimVocabulary(env, assignment) {
+export async function claimVocabulary(env, assignment, duration = 180000) {
   const token = crypto.randomUUID(), now = new Date().toISOString();
   const result = await env.DB.prepare(`UPDATE assignments SET vocabulary_job_token=?,vocabulary_job_until=?,vocabulary_job_error=NULL
     WHERE id=? AND revision=? AND deleted_at IS NULL AND (vocabulary_job_until IS NULL OR vocabulary_job_until<=?)`)
-    .bind(token, new Date(Date.now() + 180000).toISOString(), assignment.id, assignment.revision, now).run();
+    .bind(token, new Date(Date.now() + duration).toISOString(), assignment.id, assignment.revision, now).run();
   return result.meta.changes ? token : null;
 }
 
@@ -64,43 +64,72 @@ export async function finishVocabulary(env, assignmentId, token, problem = null)
     WHERE id=? AND vocabulary_job_token=?`).bind(problem, assignmentId, token).run();
 }
 
+export function vocabularyStatus(assignment) {
+  const generating = Boolean(assignment.vocabulary_job_until && assignment.vocabulary_job_until > new Date().toISOString());
+  const problem = assignment.vocabulary_job_error;
+  return {
+    generating,
+    error: (problem?.startsWith('每項詞族須有不同的詞形') ? 'Gemini 回傳的詞族資料不完整。可重新生成。' : problem) || (!generating && assignment.vocabulary_job_token
+      ? '語塊卡生成工作已逾時，可以重新啟動。' : null),
+    published: assignment.publication_state === 'published',
+    ready: assignment.vocabulary_version >= 2,
+    revision: assignment.revision,
+  };
+}
+
+export async function generateAssignmentVocabulary(env, { assignmentId, teacherId, revision, lease }, hash) {
+  const assignment = await env.DB.prepare(`SELECT * FROM assignments WHERE id=? AND teacher_id=? AND revision=?
+    AND vocabulary_job_token=? AND vocabulary_job_until>? AND deleted_at IS NULL`)
+    .bind(assignmentId, teacherId, revision, lease, new Date().toISOString()).first();
+  if (!assignment) throw Error('生成期間作業已有更新或已移除');
+  const version = assignment.vocabulary_version + 1;
+  const { results: questions } = await env.DB.prepare('SELECT id,text FROM sentences WHERE assignment_id=? ORDER BY position').bind(assignmentId).all();
+  const output = await generateVocabulary(env, teacherId, assignment, questions);
+  const cards = await cardWrites(env, hash, { ...assignment, vocabulary_version: version }, output);
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE assignments SET publication_state='published',vocabulary_version=?,
+      revision=CASE WHEN vocabulary_job_token=? THEN ? ELSE revision END,
+      vocabulary_job_token=NULL,vocabulary_job_until=NULL,vocabulary_job_error=NULL WHERE id=?`)
+      .bind(version, lease, revision + 1, assignmentId),
+    ...cards.statements,
+  ]);
+  return { published: true, count: cards.count };
+}
+
 export async function learningRoutes(req, env, url, h) {
   const { teacher, student, canEdit, fail, response, bodyJson, hash } = h;
   const path = url.pathname;
-  if (path === '/api/teacher/gemini') {
+  if (path === '/api/teacher/gemini' || path === '/api/teacher/gemini/check') {
     const account = await teacher(req, env);
-    return account ? geminiSettings(req, env, account, h) : fail('請先登入', 401);
+    return account ? geminiSettings(req, env, account, h, path.endsWith('/check')) : fail('請先登入', 401);
   }
   const generate = /^\/api\/teacher\/assignments\/([^/]+)\/(publish|vocabulary)$/.exec(path);
-  if (generate && req.method === 'POST') {
+  if (generate && (req.method === 'POST' || (req.method === 'GET' && generate[2] === 'vocabulary'))) {
     const account = await teacher(req, env);
     if (!account) return fail('請先登入', 401);
     const assignment = await env.DB.prepare('SELECT * FROM assignments WHERE id=? AND deleted_at IS NULL').bind(generate[1]).first();
     if (!assignment || account.id !== assignment.teacher_id) return fail('只有發布教師可以使用自己的 Gemini Key 生成', 404);
-    if (assignment.publication_state === 'published' && assignment.vocabulary_version >= 2)
+    if (req.method === 'GET') return response(vocabularyStatus(assignment));
+    if (generate[2] === 'publish' && assignment.publication_state === 'published' && assignment.vocabulary_version >= 2)
       return response({ published: true });
-    const lease = await claimVocabulary(env, assignment);
-    if (!lease) return response({ generating: true }, 202);
-    const publish = async () => { try {
-      const { results: questions } = await env.DB.prepare('SELECT id,text FROM sentences WHERE assignment_id=? ORDER BY position').bind(assignment.id).all();
-      const output = await generateVocabulary(env, account.id, assignment, questions);
-      const cards = await cardWrites(env, hash, { ...assignment, vocabulary_version: 2 }, output);
-      await env.DB.batch([
-        env.DB.prepare(`UPDATE assignments SET publication_state='published',vocabulary_version=2,
-          revision=CASE WHEN vocabulary_job_token=? THEN ? ELSE revision END,
-          vocabulary_job_token=NULL,vocabulary_job_until=NULL,vocabulary_job_error=NULL WHERE id=?`)
-          .bind(lease, assignment.revision + 1, assignment.id),
-        ...cards.statements,
-      ]);
-      return response({ published: true, count: cards.count });
-    } catch (error) {
-      const problem = /assignment_revision_conflict/.test(String(error)) ? '生成期間作業已有更新，請重新讀取' : error.message;
-      await finishVocabulary(env, assignment.id, lease, problem);
-      return fail(problem, 422);
-    } };
-    const work = publish();
-    h.waitUntil?.(work);
-    return work;
+    const enqueue = async () => {
+      const lease = await claimVocabulary(env, assignment, 15 * 60 * 1000);
+      if (!lease) return response({ generating: true }, 202);
+      try {
+        await env.VOCABULARY_WORKFLOW.create({
+          id: lease,
+          params: { assignmentId: assignment.id, teacherId: account.id, revision: assignment.revision, lease },
+        });
+        return response({ generating: true }, 202);
+      } catch {
+        const problem = '暫時無法排入語塊卡生成工作，請稍後重試。';
+        await finishVocabulary(env, assignment.id, lease, problem);
+        return fail(problem, 503);
+      }
+    };
+    const queued = enqueue();
+    h.waitUntil(queued);
+    return queued;
   }
 
   const edit = /^\/api\/teacher\/question-vocabulary\/([^/]+)$/.exec(path);
@@ -115,14 +144,17 @@ export async function learningRoutes(req, env, url, h) {
     if (input.revision !== assignment.revision) return fail('作業已更新，請重新載入後修改', 409);
     const text = (value, max) => typeof value === 'string' && value.trim() && value.trim().length <= max ? value.trim() : '';
     const pronunciation = text(input.pronunciation, 180), meaning = text(input.meaning, 350), usage = text(input.usage, 350);
+    const partOfSpeech = text(input.partOfSpeech, 80), usageZh = text(input.usageZh, 350);
+    const baseForm = text(input.baseForm, 180);
+    const verbForms = Array.isArray(input.verbForms) ? input.verbForms.map(value => text(value, 180)) : [];
     const examples = Array.isArray(input.examples) ? [...new Set(input.examples.map(value => text(value, 350)).filter(Boolean))] : [];
     const similar = Array.isArray(input.similar) ? [...new Set(input.similar.map(value => text(value, 350)).filter(Boolean))] : [];
     const required = assignment.language === 'en' ? 3 : 2;
-    if (!pronunciation || !meaning || !usage || examples.length !== required || similar.length > 3)
+    if (!pronunciation || !meaning || !usage || (examples.length !== required && !(partOfSpeech === '專有名詞' && !examples.length)) || similar.length > 3)
       return fail(`請填寫發音、翻譯、使用情境及 ${required} 個不同的例句。相似詞最多 3 個。`);
     const { results: questions } = await env.DB.prepare('SELECT id,text FROM sentences WHERE assignment_id=? ORDER BY position').bind(assignment.id).all();
     const output = [];
-    let found = false;
+    let found = false, problem;
     for (const q of questions) {
       const context = await cardsHash(hash, { ...assignment, text: q.text });
       const rows = await env.DB.prepare('SELECT id,content FROM vocabulary_cards WHERE sentence_id=? AND context_hash=? ORDER BY start_offset')
@@ -131,11 +163,22 @@ export async function learningRoutes(req, env, url, h) {
         const card = JSON.parse(row.content);
         if (q.id !== edit[1] || row.id !== input.cardId) return card;
         found = true;
-        return { ...card, pronunciation, meaning, usage, examples, similar };
+        let wordFamily = [];
+        try { wordFamily = readWordFamily(input.wordFamily ?? card.wordFamily ?? [], card.wordFamily); }
+        catch (error) { problem = error.message; }
+        if (card.partOfSpeech && !partOfSpeech) problem = '請填寫詞性。';
+        if (assignment.language === 'en' && (card.usageZh || usageZh || card.reviewFields) &&
+          (!/\p{Script=Han}/u.test(usageZh) || !examples.every(hasChineseTranslation)))
+          problem = '請填寫中文使用情境，並在每個英文例句後加上括號中文翻譯。';
+        if (assignment.language === 'en' && (card.baseForm || baseForm || wordFamily.length || verbForms.length || card.reviewFields) &&
+          (!baseForm || !validVerbForms(partOfSpeech, baseForm, verbForms)))
+          problem = '請填寫原形。動詞的三態須依序為原形、過去式、過去分詞，且第一項須與原形相同。';
+        return { ...card, pronunciation, meaning, usage, partOfSpeech, baseForm, wordFamily, verbForms, usageZh, examples, similar, reviewFields: undefined };
       });
       output.push({ ...q, cards });
     }
     if (!found) return fail('找不到可編輯的語塊卡', 404);
+    if (problem) return fail(problem);
     const cards = await cardWrites(env, hash, { ...assignment, vocabulary_version: assignment.vocabulary_version + 1 }, output);
     try {
       await env.DB.batch([
