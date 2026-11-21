@@ -827,7 +827,7 @@ function teacherCreate(source) {
         await editor.upload(a.sentences, a.revision, files);
         const published = await request("/api/teacher/assignments/" + a.id + "/publish", { method: "POST" });
         if (!form.isConnected) return;
-        if (published.published) created(a);
+        if (published.published && !published.generating && !published.error) created(a);
         else location.hash = draftRoute;
       } catch (error) {
         if (!form.isConnected) return;
@@ -887,7 +887,7 @@ async function teacherDetail(id, notice = "") {
     const generate = document.createElement("button");
     generate.type = "button";
     generate.className = "secondary";
-    generate.textContent = isDraft ? "生成語塊並發布" : a.vocabularyReady ? "重新生成語塊卡" : "補建語塊卡";
+    generate.textContent = isDraft ? "發布並生成語塊卡" : a.vocabularyReady ? "重新生成語塊卡" : "補建語塊卡";
     generate.disabled = a.vocabularyGenerating;
     generate.hidden = !ownAssignment;
     const generationStatus = document.createElement("span");
@@ -903,14 +903,13 @@ async function teacherDetail(id, notice = "") {
           if (!detail.isConnected) return;
           if (status.generating) { watchVocabulary(); return; }
           generate.disabled = false;
-          if (status.error) { generationStatus.textContent = status.error; return; }
           if (isDraft && status.published) { await teacherDetail(id, "作業已發布"); return; }
           if (status.revision === a.revision + 1) a.revision = status.revision;
           if (status.ready) {
             a.vocabularyReady = true;
             generate.textContent = "重新生成語塊卡";
           }
-          generationStatus.textContent = "語塊卡已更新。";
+          generationStatus.textContent = status.error || "語塊卡已更新。";
         } catch (error) {
           if (!detail.isConnected) return;
           generationStatus.textContent = "暫時無法查詢語塊進度。";

@@ -14,6 +14,7 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
   let generationRequests = 0;
   let omitToken = false;
   let oversizeChunk = false;
+  let chunkException = false;
   let generationGate;
   const mf=new Miniflare(convertV4MiniflareOptions({
     modules:true,scriptPath:'.wrangler/tests/worker.mjs',compatibilityDate:'2026-10-13',d1Databases:['DB'],r2Buckets:['AUDIO'],
@@ -60,8 +61,12 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
           if (oversizeChunk && (index === 1 || index === 2)) return [];
           if ((omitToken && index === 0) || ['eggs', 'up'].includes(word)) return [];
           const base = { startToken: index, endToken: index, similar: [], baseForm: word, wordFamily: [], verbForms: [] };
-          if (!english) return [{ ...base, endToken: oversizeChunk && index === 0 ? 2 : index, pronunciation: 'wǒ', meaning: 'I', partOfSpeech: '代名詞',
-            usage: '用來說自己。', usageZh: '', examples: [{ sentence: '我想喝水。', translation: '' }, { sentence: '我在家。', translation: '' }] }];
+          if (!english) {
+            const single = { ...base, pronunciation: 'wǒ', meaning: 'I', partOfSpeech: '代名詞',
+              usage: '用來說自己。', usageZh: '', examples: [{ sentence: '我想喝水。', translation: '' }, { sentence: '我在家。', translation: '' }] };
+            if (chunkException && index === 0) return [single, { ...single, endToken: 2, partOfSpeech: '慣用語', exceptionReason: '拆開就失去約定俗成的意義' }];
+            return [{ ...single, endToken: oversizeChunk && index === 0 ? 2 : index }];
+          }
           const verb = word === 'showed' ? { baseForm: 'show up', partOfSpeech: '動詞片語',
             verbForms: ['Show up', 'showed up', 'shown up'] } :
             word === 'ran' ? { baseForm: 'run', partOfSpeech: '動詞', verbForms: ['run', 'ran', 'run'] } : {};
@@ -245,10 +250,12 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
       assert.fail('Vocabulary workflow did not finish');
     };
     assert.equal((await post(path + '/publish', tc)).res.status, 202);
-    assert.match((await waitVocabulary(path)).error, /Gemini API Key/);
+    const publishedWithoutKey = await waitVocabulary(path);
+    assert.equal(publishedWithoutKey.published, true);
+    assert.match(publishedWithoutKey.error, /Gemini API Key/);
     assert.equal(generationRequests, 0);
     assert.ok((await call(path, { cookie: tc })).data.assignment.vocabularyError);
-    assert.equal((await call('/api/assignments/code/' + draft.code)).res.status, 404);
+    assert.equal((await call('/api/assignments/code/' + draft.code)).res.status, 200);
     const geminiSettings = '/api/teacher/gemini';
     const checkGemini = geminiSettings + '/check';
     assert.deepEqual((await call(geminiSettings, { cookie: tc })).data, {
@@ -288,7 +295,7 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
     let allowGeneration;
     generationGate = new Promise(resolve => { allowGeneration = resolve; });
     try {
-      const publishes = await Promise.all([post(path + '/publish', tc), post(path + '/publish', tc)]);
+      const publishes = await Promise.all([post(path + '/vocabulary', tc), post(path + '/vocabulary', tc)]);
       assert.ok(publishes.every(reply => reply.res.status === 202 && reply.data.generating));
       assert.equal((await call(path + '/vocabulary', { cookie: tc })).data.generating, true);
       assert.equal((await call(path + '/vocabulary', { cookie: other })).res.status, 404);
@@ -408,7 +415,17 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
     const mandarin = (await post('/api/assignments', tc, { title: '華語語塊', language: 'zh-TW', cefr: 'A2',
       generateOnPublish: true, creationKey: crypto.randomUUID(), sentences: [{ text: '我下班後順路去買晚餐。' }] })).data;
     const mandarinPath = `/api/teacher/assignments/${mandarin.id}`;
+    omitToken = true;
     assert.equal((await post(mandarinPath + '/publish', tc)).res.status, 202);
+    assert.equal((await call('/api/assignments/code/' + mandarin.code)).res.status, 200);
+    const partial = await waitVocabulary(mandarinPath);
+    assert.equal(partial.published, true);
+    assert.match(partial.error, /1 個詞的詳細說明待補/);
+    const pendingCards = (await post('/api/learning/context', sc, { code: mandarin.code, questionId: mandarin.sentences[0].id })).data.cards;
+    assert.equal(pendingCards[0].word, '我');
+    assert.equal(pendingCards[0].pendingDetails, true);
+    omitToken = false;
+    assert.equal((await post(mandarinPath + '/vocabulary', tc)).res.status, 202);
     assert.equal((await waitVocabulary(mandarinPath)).published, true);
     const mandarinCards = (await post('/api/learning/context', sc, { code: mandarin.code, questionId: mandarin.sentences[0].id })).data.cards;
     assert.equal(mandarinCards[0].pronunciation, 'wǒ');
@@ -417,16 +434,25 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
     const mandarinContext = { code: mandarin.code, questionId: mandarin.sentences[0].id };
     oversizeChunk = true;
     assert.equal((await post(mandarinPath + '/vocabulary', tc)).res.status, 202);
-    assert.match((await waitVocabulary(mandarinPath)).error, /語塊過大/);
+    assert.equal((await waitVocabulary(mandarinPath)).error, null);
+    const repaired = (await post('/api/learning/context', sc, mandarinContext)).data.cards;
+    assert.deepEqual(repaired.map(card => card.word), mandarinCards.map(card => card.word));
+    assert.equal(repaired[0].meaning, mandarinCards[0].meaning);
     oversizeChunk = false;
     omitToken = true;
     assert.equal((await post(mandarinPath + '/vocabulary', tc)).res.status, 202);
-    assert.match((await waitVocabulary(mandarinPath)).error, /第 1 題漏標 1 個詞（我）/);
-    assert.deepEqual((await post('/api/learning/context', sc, mandarinContext)).data.cards, mandarinCards);
+    assert.equal((await waitVocabulary(mandarinPath)).error, null);
+    assert.deepEqual((await post('/api/learning/context', sc, mandarinContext)).data.cards.map(card => card.word),
+      mandarinCards.map(card => card.word));
     omitToken = false;
+    chunkException = true;
     assert.equal((await post(mandarinPath + '/vocabulary', tc)).res.status, 202);
     assert.equal((await waitVocabulary(mandarinPath)).published, true);
-    assert.notEqual((await post('/api/learning/context', sc, mandarinContext)).data.cards[0].id, mandarinCards[0].id);
+    const exceptionCards = (await post('/api/learning/context', sc, mandarinContext)).data.cards;
+    assert.ok(exceptionCards[0].exceptionReason);
+    assert.equal(exceptionCards[0].end, mandarinCards[2].end);
+    assert.ok(exceptionCards.every((card, index) => index === 0 || card.start >= exceptionCards[index - 1].end));
+    chunkException = false;
 
     r=await call(`/api/teacher/students/${studentId}`,{method:'PATCH',cookie:tc,body:{disabled:true}});assert.equal(r.res.status,200);
     assert.equal((await call('/api/student/me',{cookie:sc})).res.status,401);

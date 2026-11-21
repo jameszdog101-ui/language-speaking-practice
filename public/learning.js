@@ -126,6 +126,11 @@ function contextualCard(button, card, entry) {
   const body = document.createElement('div');
   body.className = 'word-popup-body';
   if (status) body.append(status);
+  if (card.pendingDetails) {
+    const pending = document.createElement('p');
+    pending.textContent = '這個詞可播放發音，詳細說明待補。';
+    body.append(pending);
+  }
   body.append(cardDetails(card));
   if (entry.onVocabularyEdited) {
     const teacherSection = document.createElement('div');

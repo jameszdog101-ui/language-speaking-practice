@@ -51,9 +51,10 @@ export async function cardWrites(env, hash, assignment, output) {
   return { statements, count };
 }
 
-export async function claimVocabulary(env, assignment, duration = 180000) {
+export async function claimVocabulary(env, assignment, duration = 180000, publish = false) {
   const token = crypto.randomUUID(), now = new Date().toISOString();
   const result = await env.DB.prepare(`UPDATE assignments SET vocabulary_job_token=?,vocabulary_job_until=?,vocabulary_job_error=NULL
+    ${publish ? ",publication_state='published',revision=revision+1" : ''}
     WHERE id=? AND revision=? AND deleted_at IS NULL AND (vocabulary_job_until IS NULL OR vocabulary_job_until<=?)`)
     .bind(token, new Date(Date.now() + duration).toISOString(), assignment.id, assignment.revision, now).run();
   return result.meta.changes ? token : null;
@@ -85,13 +86,38 @@ export async function generateAssignmentVocabulary(env, { assignmentId, teacherI
   const version = assignment.vocabulary_version + 1;
   const { results: questions } = await env.DB.prepare('SELECT id,text FROM sentences WHERE assignment_id=? ORDER BY position').bind(assignmentId).all();
   const output = await generateVocabulary(env, teacherId, assignment, questions);
+  let pending = 0;
+  for (const question of output) {
+    if (!question.cards.some(card => card.pendingDetails)) continue;
+    const previousHash = await cardsHash(hash, { ...assignment, text: question.text });
+    const rows = await env.DB.prepare('SELECT content FROM vocabulary_cards WHERE sentence_id=? AND context_hash=?')
+      .bind(question.id, previousHash).all();
+    const previous = new Map(rows.results.map(row => {
+      const card = JSON.parse(row.content);
+      return [`${card.start}:${card.end}`, card];
+    }));
+    question.cards = question.cards.map(card => {
+      if (!card.pendingDetails) return card;
+      const saved = previous.get(`${card.start}:${card.end}`);
+      if (saved?.meaning && !saved.pendingDetails) return saved;
+      pending++;
+      return card;
+    });
+  }
   const cards = await cardWrites(env, hash, { ...assignment, vocabulary_version: version }, output);
+  const firstCards = assignment.vocabulary_version === 1 ? [env.DB.prepare(`UPDATE sessions AS s
+    SET assignment_vocabulary_version=? WHERE assignment_id=? AND assignment_vocabulary_version=1
+      AND assignment_language=? AND assignment_cefr=? AND NOT EXISTS (
+        SELECT 1 FROM answers ans LEFT JOIN sentences q ON q.id=ans.sentence_id
+        WHERE ans.session_id=s.id AND (q.id IS NULL OR q.text IS NOT ans.question_text)
+      )`).bind(version, assignmentId, assignment.language, assignment.cefr)] : [];
   await env.DB.batch([
     env.DB.prepare(`UPDATE assignments SET publication_state='published',vocabulary_version=?,
       revision=CASE WHEN vocabulary_job_token=? THEN ? ELSE revision END,
-      vocabulary_job_token=NULL,vocabulary_job_until=NULL,vocabulary_job_error=NULL WHERE id=?`)
-      .bind(version, lease, revision + 1, assignmentId),
+      vocabulary_job_token=NULL,vocabulary_job_until=NULL,vocabulary_job_error=? WHERE id=?`)
+      .bind(version, lease, revision + 1, pending ? `語塊卡已更新，${pending} 個詞的詳細說明待補。` : null, assignmentId),
     ...cards.statements,
+    ...firstCards,
   ]);
   return { published: true, count: cards.count };
 }
@@ -110,20 +136,28 @@ export async function learningRoutes(req, env, url, h) {
     const assignment = await env.DB.prepare('SELECT * FROM assignments WHERE id=? AND deleted_at IS NULL').bind(generate[1]).first();
     if (!assignment || account.id !== assignment.teacher_id) return fail('只有發布教師可以使用自己的 Gemini Key 生成', 404);
     if (req.method === 'GET') return response(vocabularyStatus(assignment));
-    if (generate[2] === 'publish' && assignment.publication_state === 'published' && assignment.vocabulary_version >= 2)
-      return response({ published: true });
+    const publishing = generate[2] === 'publish';
+    if (publishing && assignment.publication_state === 'published')
+      return response({ published: true, generating: vocabularyStatus(assignment).generating });
+    if (!publishing && assignment.publication_state === 'draft') return fail('請先發布作業', 409);
     const enqueue = async () => {
-      const lease = await claimVocabulary(env, assignment, 15 * 60 * 1000);
-      if (!lease) return response({ generating: true }, 202);
+      const lease = await claimVocabulary(env, assignment, 15 * 60 * 1000, publishing);
+      if (!lease) {
+        const current = await env.DB.prepare('SELECT * FROM assignments WHERE id=? AND deleted_at IS NULL').bind(assignment.id).first();
+        if (current && (vocabularyStatus(current).generating || (publishing && current.publication_state === 'published')))
+          return response({ published: current.publication_state === 'published', generating: vocabularyStatus(current).generating }, 202);
+        return fail('作業已有變更，請重新整理後再試。', 409);
+      }
       try {
         await env.VOCABULARY_WORKFLOW.create({
           id: lease,
-          params: { assignmentId: assignment.id, teacherId: account.id, revision: assignment.revision, lease },
+          params: { assignmentId: assignment.id, teacherId: account.id, revision: assignment.revision + Number(publishing), lease },
         });
-        return response({ generating: true }, 202);
+        return response({ published: true, generating: true }, 202);
       } catch {
         const problem = '暫時無法排入語塊卡生成工作，請稍後重試。';
         await finishVocabulary(env, assignment.id, lease, problem);
+        if (publishing) return response({ published: true, generating: false, error: problem });
         return fail(problem, 503);
       }
     };
