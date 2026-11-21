@@ -43,6 +43,7 @@ export function publicAssignment(a, sentences) {
     maxAttempts: a.max_attempts,
     recordingSeconds: a.recording_seconds ?? 180,
     cefr: a.cefr ?? 'A2',
+    chunkSize: a.chunk_size ?? 'small',
     sentences: sentences.map((s) => ({
       id: s.id,
       text: s.text,
@@ -751,7 +752,8 @@ async function api(req, env, url, ctx) {
         await env.DB.prepare(
           `SELECT an.sentence_id,an.question_text,an.question_pinyin,an.accepted_attempt,COUNT(at.id) attempts,
             MAX(CASE WHEN at.attempt_number=an.accepted_attempt THEN at.id END) audio_id,
-            MAX(CASE WHEN at.attempt_number=an.accepted_attempt THEN at.mime_type END) audio_type
+            MAX(CASE WHEN at.attempt_number=an.accepted_attempt THEN at.mime_type END) audio_type,
+            MAX(CASE WHEN at.attempt_number=an.accepted_attempt THEN at.duration_seconds END) audio_duration
             FROM answers an LEFT JOIN attempts at ON at.session_id=an.session_id AND at.sentence_id=an.sentence_id AND at.deleted_at IS NULL
             WHERE an.session_id=? GROUP BY an.sentence_id ORDER BY an.question_position`,
         )
@@ -765,6 +767,7 @@ async function api(req, env, url, ctx) {
         acceptedAttempt: x.accepted_attempt,
         audioUrl: x.audio_id ? `/api/teacher/audio/${x.audio_id}` : null,
         audioType: x.audio_type,
+        audioDuration: x.audio_duration,
       }));
     }
     const questions = await sentences(env, a.id);
@@ -861,7 +864,8 @@ async function api(req, env, url, ctx) {
       });
     }
     const previousText = new Map(oldQuestions.map(q => [q.id, q.text]));
-    const levelChanged = language !== a.language || limits.cefr !== a.cefr;
+    const chunkChanged = limits.chunkSize !== a.chunk_size;
+    const levelChanged = language !== a.language || limits.cefr !== a.cefr || chunkChanged;
     const nextQuestions = questions ?? oldQuestions;
     const changedQuestions = nextQuestions.filter(q => levelChanged || previousText.get(q.id) !== q.text);
     let lease = null, vocabularyVersion = a.vocabulary_version;
@@ -870,7 +874,8 @@ async function api(req, env, url, ctx) {
       lease = await claimVocabulary(env, a);
       if (!lease) return fail('語塊卡正在生成或作業已更新，請重新讀取', 409);
       try {
-        const next = { language, cefr: limits.cefr, vocabulary_version: Math.max(2, vocabularyVersion) };
+        const next = { language, cefr: limits.cefr, chunk_size: limits.chunkSize,
+          vocabulary_version: chunkChanged ? vocabularyVersion + 1 : Math.max(2, vocabularyVersion) };
         const output = await generateVocabulary(env, t.id, next, vocabularyVersion === 1 ? nextQuestions : changedQuestions);
         changes.push(...(await cardWrites(env, hash, next, output)).statements);
         vocabularyVersion = next.vocabulary_version;
@@ -881,13 +886,13 @@ async function api(req, env, url, ctx) {
     }
     const update = env.DB.prepare(
       `UPDATE assignments SET title=?,instructions=?,language=?,starts_at=?,ends_at=?,deidentify_voice=?,
-        transform_version=?,identity_mode=?,anonymous=?,max_attempts=?,recording_seconds=?,cefr=?,vocabulary_version=?,
+        transform_version=?,identity_mode=?,anonymous=?,max_attempts=?,recording_seconds=?,cefr=?,chunk_size=?,vocabulary_version=?,
         vocabulary_job_token=NULL,vocabulary_job_until=NULL,vocabulary_job_error=NULL,
         revision=CASE WHEN (? IS NOT NULL AND vocabulary_job_token=?)
           OR (? IS NULL AND (vocabulary_job_until IS NULL OR vocabulary_job_until<=?)) THEN ? ELSE revision END WHERE id=?`
     ).bind(title, instructions, language, starts, ends, Number(deidentify),
       deidentify ? TRANSFORM_VERSION : null, identityMode, Number(identityMode === 'anonymous'),
-      limits.maxAttempts, limits.recordingSeconds, limits.cefr, vocabularyVersion,
+      limits.maxAttempts, limits.recordingSeconds, limits.cefr, limits.chunkSize, vocabularyVersion,
       lease, lease, lease, new Date().toISOString(), a.revision + 1, a.id);
     try { await env.DB.batch([update, ...changes, ...recipients]); }
     catch (error) {
@@ -955,7 +960,7 @@ async function api(req, env, url, ctx) {
     }
     const statements = [
         env.DB.prepare(
-          "INSERT INTO assignments(id,code,admin_key_hash,title,instructions,anonymous,max_attempts,created_at,teacher_id,language,starts_at,ends_at,deidentify_voice,transform_version,identity_mode,recording_seconds,cefr,publication_state,creation_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO assignments(id,code,admin_key_hash,title,instructions,anonymous,max_attempts,created_at,teacher_id,language,starts_at,ends_at,deidentify_voice,transform_version,identity_mode,recording_seconds,cefr,chunk_size,publication_state,creation_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ).bind(
           assignmentId,
           courseCode,
@@ -974,6 +979,7 @@ async function api(req, env, url, ctx) {
           identityMode,
           limits.recordingSeconds,
           limits.cefr,
+          limits.chunkSize,
           draft ? 'draft' : 'published',
           creationKey,
         ),
@@ -1214,8 +1220,9 @@ async function api(req, env, url, ctx) {
     const audio = await req.arrayBuffer();
     if (audio.byteLength < 100) return fail("未收到有效音訊資料");
     if (audio.byteLength > MAX_AUDIO) return fail("音訊檔超過 15MB", 413);
+    let duration;
     try {
-      if (type !== 'audio/wav' || wavDuration(audio) > q.recording_seconds) return fail(`每次錄音最多 ${q.recording_seconds} 秒`, 400);
+      if (type !== 'audio/wav' || (duration = wavDuration(audio)) > q.recording_seconds) return fail(`每次錄音最多 ${q.recording_seconds} 秒`, 400);
     } catch (error) { return fail(error.message); }
     const attemptId = id("r"),
       number = q.used + 1,
@@ -1223,7 +1230,7 @@ async function api(req, env, url, ctx) {
     await env.AUDIO.put(key, audio, { httpMetadata: { contentType: type } });
     try {
       const inserted = await env.DB.prepare(
-        `INSERT INTO attempts(id,session_id,sentence_id,attempt_number,r2_key,mime_type,byte_size,created_at,transform_profile,transform_version) SELECT ?,?,?,?,?,?,?,?,?,?
+        `INSERT INTO attempts(id,session_id,sentence_id,attempt_number,r2_key,mime_type,byte_size,created_at,transform_profile,transform_version,duration_seconds) SELECT ?,?,?,?,?,?,?,?,?,?,?
          WHERE (SELECT COUNT(*) FROM attempts WHERE session_id=? AND sentence_id=?) < ?
          AND EXISTS (SELECT 1 FROM answers an JOIN sessions s ON s.id=an.session_id JOIN assignments a ON a.id=s.assignment_id
            WHERE an.session_id=? AND an.sentence_id=? AND an.accepted_attempt IS NULL AND s.completed_at IS NULL
@@ -1240,6 +1247,7 @@ async function api(req, env, url, ctx) {
           new Date().toISOString(),
           q.deidentify_voice ? transformProfile : null,
           q.deidentify_voice ? transformVersion : null,
+          duration,
           s.id,
           m[2],
           q.max_attempts,

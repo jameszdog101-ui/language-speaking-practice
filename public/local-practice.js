@@ -1,4 +1,5 @@
 import { enhanceQuestion, closeWord, stopSpeech } from './learning.js';
+import { prepareRecording } from './recording.js';
 
 export function openLocalPractice(app, assignment, entry, { back, esc }) {
   const clips = new Map();
@@ -27,10 +28,17 @@ export function openLocalPractice(app, assignment, entry, { back, esc }) {
     if (review) {
       const root = app.querySelector('.practice-review');
       for (const [position, item] of assignment.sentences.entries()) {
+        const card = document.createElement('article');
+        card.className = 'item practice-review-item';
+        const badge = document.createElement('span');
+        badge.className = 'tag';
+        badge.textContent = `第 ${position + 1} 題`;
         const row = document.createElement('h4');
+        row.className = 'practice-review-text';
         row.textContent = item.text;
         row.setAttribute('aria-label', `第 ${position + 1} 題`);
-        root.append(row);
+        card.append(badge, row);
+        root.append(card);
         enhanceQuestion(row, assignment.language, { ...entry, questionId: item.id });
       }
       app.querySelector('.continue-practice').onclick = () => draw();
@@ -72,21 +80,33 @@ export function openLocalPractice(app, assignment, entry, { back, esc }) {
         const pieces = [];
         capture = new MediaRecorder(stream);
         capture.ondataavailable = event => { if (event.data.size) pieces.push(event.data); };
-        capture.onstop = () => {
+        const startedAt = performance.now();
+        const secondsLimit = question.recordingSeconds || 180;
+        capture.onstop = async () => {
           clearTimeout(limitTimer);
           stream.getTracks().forEach(track => track.stop());
           if (disposed) return;
           const blob = new Blob(pieces, { type: capture.mimeType });
-          if (blob.size) { clips.set(question.id, blob); playback(); }
-          status.textContent = blob.size ? '練習錄音已準備，可播放確認。' : '未錄到音訊，請再試一次。';
           button.classList.remove('live');
+          status.textContent = '正在準備練習錄音…';
+          try {
+            const seconds = Math.min(secondsLimit, (performance.now() - startedAt) / 1000 + 0.75);
+            const recording = await prepareRecording(blob, seconds);
+            if (disposed) return;
+            clips.set(question.id, recording);
+            playback();
+            status.textContent = '練習錄音已準備，可播放確認。';
+          } catch {
+            if (disposed) return;
+            status.textContent = '無法讀取本次練習錄音，請再試一次。';
+          }
           button.disabled = false;
           button.setAttribute('aria-label', '開始練習錄音');
           button.textContent = '●';
           busy(false);
         };
         capture.start();
-        limitTimer = setTimeout(() => { if (capture.state === 'recording') capture.stop(); }, (question.recordingSeconds || 180) * 1000);
+        limitTimer = setTimeout(() => { if (capture.state === 'recording') capture.stop(); }, secondsLimit * 1000);
         button.disabled = false;
         button.classList.add('live');
         button.setAttribute('aria-label', '停止練習錄音');

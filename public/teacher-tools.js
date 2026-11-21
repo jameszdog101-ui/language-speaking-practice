@@ -4,8 +4,16 @@ const optionalNumber = value => value === '' ? null : Number(value);
 export function limitsEditor(form, assignment = {}) {
   const box = document.createElement('fieldset');
   box.className = 'assignment-settings';
-  box.innerHTML = `<legend>整份作業預設</legend><div class="row"><label>每次錄音上限（秒）<input name="recordingSeconds" required type="number" min="1" max="180" value="${assignment.recordingSeconds ?? 180}"></label><label>每題錄製次數<input name="maxAttempts" required type="number" min="1" max="10" value="${assignment.maxAttempts ?? 2}"></label><label><span class="vocabulary-level-label">語塊例句與相似詞程度</span><select name="cefr">${['A1','A2','B1','B2','C1','C2'].map(level => `<option value="${level}" ${level === (assignment.cefr || 'A2') ? 'selected' : ''}>${level}</option>`).join('')}</select></label></div><button type="button" class="secondary apply-limits">全部題目使用整份預設</button>`;
+  box.innerHTML = `<legend>整份作業預設</legend><div class="assignment-settings-grid"><label>每次錄音上限（秒）<input name="recordingSeconds" required type="number" min="1" max="180" value="${assignment.recordingSeconds ?? 180}"></label><label>每題錄製次數<input name="maxAttempts" required type="number" min="1" max="10" value="${assignment.maxAttempts ?? 2}"></label><label><span class="vocabulary-level-label">語塊例句與相似詞程度</span><select name="cefr">${['A1','A2','B1','B2','C1','C2'].map(level => `<option value="${level}" ${level === (assignment.cefr || 'A2') ? 'selected' : ''}>${level}</option>`).join('')}</select></label></div><div class="assignment-settings-foot"><button type="button" class="secondary apply-limits">全部題目使用整份預設</button></div>`;
   form.querySelector('.question-editor').before(box);
+  const chunkSize = document.createElement('label');
+  chunkSize.innerHTML = `AI 語塊範圍<select name="chunkSize">
+    <option value="small">小｜每個語塊最多 2 詞</option>
+    <option value="medium">中｜每個語塊最多 3 詞</option>
+    <option value="large">大｜每個語塊最多 5 詞</option>
+  </select>`;
+  box.querySelector('.assignment-settings-grid').append(chunkSize);
+  form.elements.chunkSize.value = assignment.chunkSize || 'small';
   const language = form.elements.language;
   const descriptor = box.querySelector('.vocabulary-level-label');
   const labels = ['入門', '基礎', '進階', '高階', '流利', '精通'];
@@ -26,6 +34,7 @@ export function limitsEditor(form, assignment = {}) {
     recordingSeconds: Number(form.elements.recordingSeconds.value),
     maxAttempts: Number(form.elements.maxAttempts.value),
     cefr: form.elements.cefr.value,
+    chunkSize: form.elements.chunkSize.value,
   });
 }
 
@@ -113,7 +122,7 @@ export function questionsEditor(root, request, esc, assignment, isPublished) {
 export function assignmentsPicker(form, request, esc, initial = [], assignmentId) {
   const box = document.createElement('fieldset');
   box.className = 'assignment-settings';
-  box.innerHTML = '<legend>學生指派（選填）</legend><button type="button" class="secondary" aria-expanded="false">作業布置給</button> <span class="selection-count"></span><div class="student-checklist" hidden></div>';
+  box.innerHTML = '<legend>學生指派（選填）</legend><div class="assignment-picker-bar"><button type="button" class="secondary" aria-expanded="false">作業布置給</button><span class="selection-count"></span></div><div class="student-checklist" hidden></div>';
   form.querySelector('.question-editor').before(box);
   const selected = new Set(initial);
   const list = box.querySelector('.student-checklist'), toggle = box.querySelector('button');
@@ -148,15 +157,17 @@ export function assignmentsPicker(form, request, esc, initial = [], assignmentId
 
 export function assignmentSplitter(form, request, editor) {
   const box = document.createElement('fieldset');
-  box.className = 'assignment-settings';
+  box.className = 'assignment-settings assignment-splitter';
   box.innerHTML = `<legend>AI 分題</legend>
     <label>原文<textarea class="split-source notranslate" translate="no" rows="5" maxlength="12000" placeholder="貼上要分成多題的朗讀原文"></textarea></label>
-    <div class="row">
+    <div class="split-options">
       <label>要切成幾題（1–30）<input class="split-count" type="text" inputmode="numeric" maxlength="2" value="4"></label>
       <label>特殊需求（選填）<textarea class="split-requirements" rows="2" maxlength="1500" placeholder="例如：保留對話段落，或讓各題長度接近"></textarea></label>
     </div>
-    <button type="button" class="secondary split-run">AI 分題並帶入題目</button>
-    <small>分題會使用你的 Gemini 設定與專案配額。</small>
+    <div class="split-actions">
+      <button type="button" class="secondary split-run">AI 分題並帶入題目</button>
+      <small class="muted">分題會使用你的 Gemini 設定與專案配額。</small>
+    </div>
     <p class="split-status" role="status"></p>`;
   const questionArea = form.querySelector('.question-editor');
   questionArea.before(box);

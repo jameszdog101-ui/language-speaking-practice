@@ -11,7 +11,7 @@ export async function playableSource(url) {
   const response=await fetch(url);if(!response.ok)throw Error('音檔無法讀取');
   const wav=await prepareRecording(await response.blob(),Infinity);
   const local=URL.createObjectURL(wav);
-  return {url:local,release(){URL.revokeObjectURL(local);}};
+  return {url:local,duration:(wav.size - 44) / 64000,release(){URL.revokeObjectURL(local);}};
 }
 const sources=new Map();
 export function installPlayback() {

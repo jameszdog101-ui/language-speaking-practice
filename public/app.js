@@ -442,11 +442,12 @@ async function practice() {
           const profile = a.deidentifyVoice
             ? VOICE_PROFILES[state.session.voiceProfile]
             : null;
-          const normalized = await prepareRecording(rawBlob, secondsLimit);
+          const elapsedLimit = Math.min(secondsLimit, (performance.now() - startedAt) / 1000 + 0.75);
+          const normalized = await prepareRecording(rawBlob, elapsedLimit);
           const processed = profile
             ? await transformRecording(normalized, profile)
             : normalized;
-          const blob = await prepareRecording(processed, secondsLimit);
+          const blob = profile ? await prepareRecording(processed, elapsedLimit) : processed;
           if (disposed) return;
           const result = await request(
             `/api/sessions/${state.session.sessionId}/sentences/${q.id}/attempts`,

@@ -110,3 +110,7 @@
 .voice-card .avatar { height: auto; }
 .voice-card-expanded .voice-card-top b { font-size: 19px; }
 .voice-card-expanded .voice-wave { height: 46px; }
+.question-panel .question-player { justify-content: flex-start; margin: 0 0 10px; background: rgba(255, 255, 255, 0.85); }
+.voice-options label { color: #585070; font-weight: 700; }
+.voice-options select { border-color: #c7bde0; border-radius: 8px; background: #fff; color: #1c1632; }
+.voice-submitted { display: block; color: #585070; margin-top: 2px; }

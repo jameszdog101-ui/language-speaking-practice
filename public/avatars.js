@@ -27,18 +27,20 @@ export function editAvatar(root, path, current, done) {
   dialog.className = 'avatar-dialog';
   dialog.setAttribute('aria-label', '設定頭像');
   dialog.innerHTML = `<h3>設定頭像</h3>
-    <div class="profile-avatar avatar-preview" aria-hidden="true"></div>
-    <video playsinline muted hidden aria-label="相機預覽"></video>
-    <div class="actions">
+    <div class="avatar-stage">
+      <div class="profile-avatar avatar-preview" aria-hidden="true"></div>
+      <video playsinline muted hidden aria-label="相機預覽"></video>
+    </div>
+    <div class="actions avatar-source-actions">
       <button type="button" class="secondary choose-avatar">從相簿選擇</button>
       <input type="file" accept="image/*" hidden aria-label="從相簿選擇頭像">
       <button type="button" class="secondary open-camera">開啟相機</button>
       <button type="button" class="take-avatar" hidden disabled>拍照</button>
     </div>
     <p role="status"></p>
-    <div class="actions">
+    <div class="actions avatar-dialog-actions">
       <button type="button" class="secondary cancel-avatar" autofocus>取消</button>
-      <button type="button" class="secondary remove-avatar">移除頭像</button>
+      <button type="button" class="danger remove-avatar">移除頭像</button>
       <button type="button" class="save-avatar" disabled>儲存頭像</button>
     </div>`;
   const preview = dialog.querySelector('.avatar-preview');

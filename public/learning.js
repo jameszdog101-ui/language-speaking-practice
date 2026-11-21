@@ -40,15 +40,21 @@ async function showWord(button) {
   button.classList.add('word-selected'); button.setAttribute('aria-expanded', 'true');
   popup = document.createElement('aside');
   popup.className = 'word-popup notranslate'; popup.setAttribute('translate', 'no'); popup.setAttribute('role', 'dialog'); popup.setAttribute('aria-label', '單字解釋');
+  const head = document.createElement('div'); head.className = 'word-popup-head';
+  const titleWrap = document.createElement('div'); titleWrap.className = 'word-popup-title';
   const heading = document.createElement('strong'); heading.textContent = button.textContent;
-  const play = document.createElement('button'); play.textContent = '▶ English'; play.onclick = () => speak(button.textContent, 'en');
-  const close = document.createElement('button'); close.textContent = '×'; close.setAttribute('aria-label','關閉單字解釋'); close.onclick = () => { const target = selected; closeWord(); target?.focus(); };
-  const content = document.createElement('div'); content.textContent = '讀取詞義…';
-  popup.append(heading, play, close, content);
+  const play = document.createElement('button'); play.type = 'button'; play.className = 'secondary word-popup-play'; play.textContent = '▶ English'; play.onclick = () => speak(button.textContent, 'en');
+  titleWrap.append(heading, play);
+  const actions = document.createElement('div'); actions.className = 'word-popup-actions';
+  const close = document.createElement('button'); close.type = 'button'; close.className = 'word-popup-close'; close.textContent = '×'; close.setAttribute('aria-label','關閉單字解釋'); close.onclick = () => { const target = selected; closeWord(); target?.focus(); };
+  actions.append(close);
+  head.append(titleWrap, actions);
+  const content = document.createElement('div'); content.className = 'word-popup-body'; content.textContent = '讀取詞義…';
+  popup.append(head, content);
   (document.fullscreenElement || document.body).append(popup);
   const rect = button.getBoundingClientRect();
   popup.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - popup.offsetWidth - 8))}px`;
-  popup.style.top = `${Math.min(rect.bottom + 8, Math.max(8, innerHeight - 280))}px`;
+  popup.style.top = `${Math.max(8, Math.min(rect.bottom + 8, innerHeight - popup.offsetHeight - 8))}px`;
   const language = localStorage.getItem('platformLanguage') || 'zh-TW';
   const key = `${button.textContent.toLowerCase()}:${language}`;
   try {
@@ -75,21 +81,60 @@ function contextualCard(button, card, entry) {
   popup.setAttribute('role', 'dialog');
   popup.setAttribute('aria-label', '語境語塊卡');
   popup.setAttribute('translate', 'no');
+  const head = document.createElement('div');
+  head.className = 'word-popup-head';
+  const titleWrap = document.createElement('div');
+  titleWrap.className = 'word-popup-title';
   const title = document.createElement('strong');
   title.textContent = card.phrase || card.word;
   const play = document.createElement('button');
+  play.type = 'button';
+  play.className = 'secondary word-popup-play';
   play.textContent = '▶ 發音';
   play.onclick = () => speak(card.phrase || card.word, card.language);
+  titleWrap.append(title, play);
+  const actions = document.createElement('div');
+  actions.className = 'word-popup-actions';
+  let status;
+  if (entry.allowSave) {
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'word-popup-save';
+    save.textContent = '收藏單字';
+    status = document.createElement('small');
+    status.className = 'word-popup-status';
+    status.setAttribute('role', 'status');
+    save.onclick = async () => {
+      save.disabled = true;
+      status.textContent = '';
+      try {
+        await learningRequest('/api/student/vocabulary', { ...learningContext(entry), cardId: card.id }, entry.sessionToken);
+        save.textContent = '已收藏';
+        save.classList.add('is-saved');
+      } catch (error) { status.textContent = error.message; save.disabled = false; }
+    };
+    actions.append(save);
+  }
   const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'word-popup-close';
   close.textContent = '×';
   close.setAttribute('aria-label', '關閉單字卡');
   close.onclick = () => { closeWord(); button.focus(); };
-  popup.append(title, play, close, cardDetails(card));
+  actions.append(close);
+  head.append(titleWrap, actions);
+  const body = document.createElement('div');
+  body.className = 'word-popup-body';
+  if (status) body.append(status);
+  body.append(cardDetails(card));
   if (entry.onVocabularyEdited) {
+    const teacherSection = document.createElement('div');
+    teacherSection.className = 'word-popup-teacher';
     if (card.reviewFields?.length) {
       const review = document.createElement('p');
+      review.className = 'word-card-review';
       review.textContent = '待教師補充：' + card.reviewFields.join('、');
-      popup.append(review);
+      teacherSection.append(review);
     }
     const edit = document.createElement('button');
     edit.type = 'button';
@@ -99,22 +144,10 @@ function contextualCard(button, card, entry) {
       edit.replaceWith(vocabularyForm(card, entry));
       popup.querySelector('input')?.focus({ preventScroll: true });
     };
-    popup.append(edit);
+    teacherSection.append(edit);
+    body.append(teacherSection);
   }
-  if (entry.allowSave) {
-    const save = document.createElement('button');
-    save.textContent = '收藏單字';
-    const status = document.createElement('small');
-    status.setAttribute('role', 'status');
-    save.onclick = async () => {
-      save.disabled = true;
-      try {
-        await learningRequest('/api/student/vocabulary', { ...learningContext(entry), cardId: card.id }, entry.sessionToken);
-        save.textContent = '已收藏';
-      } catch (error) { status.textContent = error.message; save.disabled = false; }
-    };
-    popup.append(save, status);
-  }
+  popup.append(head, body);
   (document.fullscreenElement || document.body).append(popup);
   const rect = button.getBoundingClientRect();
   popup.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - popup.offsetWidth - 8))}px`;
@@ -185,20 +218,68 @@ function vocabularyForm(card, entry) {
 
 function cardDetails(card) {
   const container = document.createElement('div');
-  const append = (label, value) => {
+  container.className = 'word-card-details';
+
+  const meta = document.createElement('div');
+  meta.className = 'word-card-meta';
+  const addChip = (label, value, accent = '') => {
+    if (!value) return;
+    const chip = document.createElement('span');
+    chip.className = 'word-card-chip' + (accent ? ` ${accent}` : '');
+    const key = document.createElement('span');
+    key.className = 'word-card-chip-label';
+    key.textContent = label;
+    const text = document.createElement('span');
+    text.textContent = value;
+    chip.append(key, text);
+    meta.append(chip);
+  };
+  addChip(card.language === 'en' ? 'KK 音標' : '拼音', card.pronunciation, 'is-pron');
+  addChip('詞性', card.partOfSpeech, 'is-pos');
+  addChip('原形', card.baseForm);
+  addChip('動詞三態', card.verbForms?.join(' – '));
+  if (meta.childElementCount) container.append(meta);
+
+  const meaningSection = document.createElement('div');
+  meaningSection.className = 'word-card-section word-card-meaning';
+  const appendLine = (parent, label, value, cls = '') => {
     if (!value) return;
     const line = document.createElement('p');
+    if (cls) line.className = cls;
     const title = document.createElement('b');
-    title.textContent = `${label}　`;
-    line.append(title, value);
-    container.append(line);
+    title.textContent = label;
+    const text = document.createElement('span');
+    text.textContent = value;
+    line.append(title, text);
+    parent.append(line);
   };
-  append(card.language === 'en' ? 'KK 音標' : '拼音', card.pronunciation);
-  append('詞性', card.partOfSpeech);
-  append('原形', card.baseForm);
-  append('動詞三態', card.verbForms?.join(' – '));
+  appendLine(meaningSection, card.language === 'en' ? '上下文中文意思' : '上下文英文意思', card.meaning, 'word-card-primary-meaning');
+  appendLine(meaningSection, card.language === 'en' ? '英文使用情境' : '中文使用情境', card.usage);
+  if (card.language === 'en') appendLine(meaningSection, '使用情境的中文解釋', card.usageZh);
+  if (meaningSection.childElementCount) container.append(meaningSection);
+
+  if (card.examples.length) {
+    const section = document.createElement('div');
+    section.className = 'word-card-section word-card-examples';
+    const label = document.createElement('b');
+    label.className = 'word-card-section-title';
+    label.textContent = `例句（${card.cefr}）`;
+    const list = document.createElement('ul');
+    list.setAttribute('aria-label', `例句（${card.cefr}）`);
+    for (const example of card.examples) {
+      const item = document.createElement('li');
+      item.textContent = example;
+      list.append(item);
+    }
+    section.append(label, list);
+    container.append(section);
+  }
+
   if (card.wordFamily?.length) {
+    const section = document.createElement('div');
+    section.className = 'word-card-section word-card-family';
     const title = document.createElement('b');
+    title.className = 'word-card-section-title';
     title.textContent = '詞族與詞形變化';
     const list = document.createElement('ul');
     for (const family of card.wordFamily) {
@@ -208,29 +289,34 @@ function cardDetails(card) {
         const word = document.createElement('b');
         word.textContent = `${family.word}（${family.partOfSpeech}）`;
         const example = document.createElement('div');
+        example.className = 'word-card-family-example';
         example.textContent = family.example;
         item.append(word, example);
       }
       list.append(item);
     }
-    container.append(title, list);
+    section.append(title, list);
+    container.append(section);
   }
-  append(card.language === 'en' ? '上下文中文意思' : '上下文英文意思', card.meaning);
-  append(card.language === 'en' ? '英文使用情境' : '中文使用情境', card.usage);
-  if (card.language === 'en') append('使用情境的中文解釋', card.usageZh);
-  if (card.examples.length) {
-    const list = document.createElement('ul');
-    list.setAttribute('aria-label', `例句（${card.cefr}）`);
-    for (const example of card.examples) {
-      const item = document.createElement('li');
-      item.textContent = example;
-      list.append(item);
-    }
+
+  if (card.similar?.length) {
+    const section = document.createElement('div');
+    section.className = 'word-card-section word-card-similar';
     const label = document.createElement('b');
-    label.textContent = `例句（${card.cefr}）`;
-    container.append(label, list);
+    label.className = 'word-card-section-title';
+    label.textContent = `相似詞（${card.cefr}）`;
+    const chips = document.createElement('div');
+    chips.className = 'word-card-similar-list';
+    for (const item of card.similar) {
+      const tag = document.createElement('span');
+      tag.className = 'word-card-similar-chip';
+      tag.textContent = item;
+      chips.append(tag);
+    }
+    section.append(label, chips);
+    container.append(section);
   }
-  append(`相似詞（${card.cefr}）`, card.similar.join('、'));
+
   return container;
 }
 
@@ -299,8 +385,8 @@ function questionPlayer(text, language, words, highlight) {
   rateSlider.oninput = () => changeQuestionRate(rateSlider.valueAsNumber, false);
   rateSlider.onchange = () => changeQuestionRate(rateSlider.valueAsNumber, true);
   speed.append(rateLabel, rateSlider);
-  let position = 0, utterance, resumeAfterSeek = false, tracking = false;
-  const playback = { element, pause() { utterance = null; update(); } };
+  let position = 0, utterance, estimateTimer, resumeAfterSeek = false, tracking = false;
+  const playback = { element, pause() { clearInterval(estimateTimer); utterance = null; update(); } };
   function update() {
     const playing = activeQuestion === playback;
     play.textContent = playing ? 'Ⅱ' : '▶';
@@ -321,13 +407,38 @@ function questionPlayer(text, language, words, highlight) {
     phrase.lang = language === 'en' ? 'en-US' : language;
     phrase.rate = questionRate;
     utterance = phrase;
+    const start = position;
+    const wordStarts = [0];
+    for (let index = start; index < end - 1; index++) {
+      const span = text.slice(words[index], words[index + 1]);
+      const letters = (span.match(/[\p{L}\p{N}]/gu) || []).length;
+      const estimate = language === 'en' ? 210 + 38 * letters : 205 * Math.max(1, letters);
+      const pause = /[.!?。！？]/u.test(span) ? 230 : /[,，、;；]/u.test(span) ? 110 : 0;
+      wordStarts.push(wordStarts.at(-1) + (estimate + pause) / phrase.rate);
+    }
+    phrase.onstart = () => {
+      if (utterance !== phrase) return;
+      const started = performance.now();
+      estimateTimer = setInterval(() => {
+        if (utterance !== phrase) return;
+        const elapsed = performance.now() - started;
+        let next = position;
+        while (next + 1 < end && wordStarts[next + 1 - start] <= elapsed) next++;
+        if (next !== position) { position = next; update(); }
+      }, 65);
+    };
     phrase.onboundary = event => {
-      if (utterance !== phrase || event.name !== 'word') return;
-      while (position + 1 < end && words[position + 1] <= offset + event.charIndex) position++;
+      if (utterance !== phrase || (event.name && event.name !== 'word') || !Number.isInteger(event.charIndex)) return;
+      let next = start;
+      while (next + 1 < end && words[next + 1] <= offset + event.charIndex) next++;
+      if (next === start) return;
+      clearInterval(estimateTimer);
+      position = next;
       update();
     };
     phrase.onend = () => {
       if (utterance !== phrase) return;
+      clearInterval(estimateTimer);
       position = end;
       if (endOffset < text.length && end < words.length && element.isConnected) { update(); read(endOffset); }
       else stopSpeech();
@@ -486,17 +597,20 @@ export async function showVocabulary(root, request) {
       const length = (key.match(/[\p{L}\p{N}]/gu) || []).length;
       const saved = Date.parse(card.savedAt);
       const row = document.createElement('details');
-      row.className = 'item';
+      row.className = 'item vocabulary-item';
       const title = document.createElement('summary');
       const word = document.createElement('span');
+      word.className = 'vocabulary-word';
       word.textContent = label;
       const meta = document.createElement('small');
       meta.className = 'muted vocabulary-meta';
       meta.textContent = Number.isFinite(saved) ? `${dateFormat.format(saved)} · ${length} 字元` : `${length} 字元`;
       title.append(word, meta);
+      const body = document.createElement('div');
+      body.className = 'vocabulary-item-body';
       const remove = document.createElement('button');
       remove.type = 'button';
-      remove.className = 'secondary';
+      remove.className = 'danger';
       remove.textContent = '移除收藏';
       remove.onclick = async () => {
         remove.disabled = true;
@@ -506,7 +620,11 @@ export async function showVocabulary(root, request) {
           render();
         } catch (error) { alert(error.message); remove.disabled = false; }
       };
-      row.append(title, cardDetails(card), remove);
+      const footer = document.createElement('div');
+      footer.className = 'vocabulary-item-actions';
+      footer.append(remove);
+      body.append(cardDetails(card), footer);
+      row.append(title, body);
       return [card.id, { row, label, key, length, saved: Number.isFinite(saved) ? saved : 0 }];
     }));
     const comparators = {

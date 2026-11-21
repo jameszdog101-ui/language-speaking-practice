@@ -81,6 +81,10 @@ export function openClassroom(app, { preview, id, request }) {
           : await playableSource(answer.audioUrl);
         if (playback !== attempt) { loaded.release(); return; }
         source = loaded;
+        if (Number.isFinite(loaded.duration) && loaded.duration > 0) {
+          card.verifiedDuration = loaded.duration;
+          card.duration = loaded.duration;
+        }
         audio.src = source.url;
       }
       audio.playbackRate = card.rate;
@@ -147,7 +151,8 @@ export function openClassroom(app, { preview, id, request }) {
       submitted.textContent = Number.isFinite(timestamp) ? `繳交 ${submissionTime.format(timestamp)}` : (s.completedAt ? '已繳交' : '尚未繳交');
       card.querySelector('.voice-card-top b').parentElement.append(submitted);
       card.playhead = 0;
-      card.duration = preview ? 8 : 0;
+      card.verifiedDuration = Number.isFinite(answer.audioDuration) && answer.audioDuration > 0 ? answer.audioDuration : 0;
+      card.duration = preview ? 8 : card.verifiedDuration;
       card.rate = 1;
       const seekBox = document.createElement('div');
       seekBox.className = 'voice-seek';
@@ -156,6 +161,7 @@ export function openClassroom(app, { preview, id, request }) {
       const seek = seekBox.querySelector('input');
       const formatTime = value => `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2, '0')}`;
       card.updateProgress = () => {
+        if (card.duration) card.playhead = Math.min(card.playhead, card.duration);
         seek.max = card.duration;
         seek.disabled = !(card.duration > 0);
         seek.value = card.playhead;
@@ -177,6 +183,7 @@ export function openClassroom(app, { preview, id, request }) {
         card.style.left = `${p.x}px`; card.style.top = `${p.y}px`;
       };
       card.place = place;
+      card.updateProgress();
       const controls = document.createElement('div');
       controls.className = 'voice-options';
       controls.innerHTML = '<label>速度 <select aria-label="錄音播放速度"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label><button type="button" class="secondary" aria-pressed="false">放大</button>';
@@ -260,12 +267,12 @@ export function openClassroom(app, { preview, id, request }) {
   audio.onerror = () => { if (active) { const card = active; stop(); card.querySelector('.voice-status').textContent = '音檔無法載入，請重試或重新登入'; } };
   audio.onloadedmetadata = () => {
     if (!active) return;
-    if (Number.isFinite(audio.duration) && audio.duration > 0) active.duration = audio.duration;
+    if (!active.verifiedDuration && Number.isFinite(audio.duration) && audio.duration > 0) active.duration = audio.duration;
     if (active.playhead > 0) audio.currentTime = active.playhead;
     active.updateProgress();
   };
   audio.ondurationchange = () => {
-    if (active && Number.isFinite(audio.duration) && audio.duration > 0) { active.duration = audio.duration; active.updateProgress(); }
+    if (active && !active.verifiedDuration && Number.isFinite(audio.duration) && audio.duration > 0) { active.duration = audio.duration; active.updateProgress(); }
   };
   audio.ontimeupdate = () => { if (active && Number.isFinite(audio.currentTime)) { active.playhead = audio.currentTime; active.updateProgress(); } };
   window.addEventListener('keydown', e => { if (e.target.closest('button,input,select,textarea')) return; if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); change(e.key === 'ArrowLeft' ? -1 : 1); } }, {signal: events.signal});

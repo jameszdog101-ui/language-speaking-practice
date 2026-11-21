@@ -13,6 +13,7 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
   const geminiKey = 'AQ.TEST_teacher_key_000001';
   let generationRequests = 0;
   let omitToken = false;
+  let oversizeChunk = false;
   let generationGate;
   const mf=new Miniflare(convertV4MiniflareOptions({
     modules:true,scriptPath:'.wrangler/tests/worker.mjs',compatibilityDate:'2026-10-13',d1Databases:['DB'],r2Buckets:['AUDIO'],
@@ -45,7 +46,7 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
       const english = input.language === 'en';
       if (english) {
         assert.equal(input.cefr, 'B1');
-        assert.equal(input.questions.length, 2);
+        assert.equal(input.questions.length, input.maxChunkWords === 3 ? 3 : 2);
       }
       const questions = input.questions.map(question => {
         assert.equal(question.lastToken, question.tokens.length - 1);
@@ -56,9 +57,10 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
         const incompleteTokens = [];
         const cards = tokens.flatMap((word, index) => {
           if (word === 'frag') { incompleteTokens.push(index); return []; }
+          if (oversizeChunk && (index === 1 || index === 2)) return [];
           if ((omitToken && index === 0) || ['eggs', 'up'].includes(word)) return [];
           const base = { startToken: index, endToken: index, similar: [], baseForm: word, wordFamily: [], verbForms: [] };
-          if (!english) return [{ ...base, pronunciation: 'wǒ', meaning: 'I', partOfSpeech: '代名詞',
+          if (!english) return [{ ...base, endToken: oversizeChunk && index === 0 ? 2 : index, pronunciation: 'wǒ', meaning: 'I', partOfSpeech: '代名詞',
             usage: '用來說自己。', usageZh: '', examples: [{ sentence: '我想喝水。', translation: '' }, { sentence: '我在家。', translation: '' }] }];
           const verb = word === 'showed' ? { baseForm: 'show up', partOfSpeech: '動詞片語',
             verbForms: ['Show up', 'showed up', 'shown up'] } :
@@ -298,6 +300,7 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
     assert.equal((await post(path + '/publish', tc)).data.published, true);
     assert.equal(generationRequests, 1);
     const assignment = (await call(path, { cookie: tc })).data.assignment;
+    assert.equal(assignment.chunkSize, 'small');
     const [first, second] = assignment.sentences;
     assert.equal((await call('/api/teacher/student-assignments', { cookie: tc })).data.students[0].assignments[0].completedAt, null);
     assert.equal((await call('/api/teacher/student-assignments', { cookie: other })).data.students.length, 0);
@@ -350,12 +353,14 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
     assert.equal((await post('/api/learning/context', sc, context)).data.cards.find(card => card.word === 'tea eggs').meaning, '茶葉滷蛋');
     assert.equal((await post('/api/learning/context', sc, { sessionId: old.sessionId, questionId: first.id })).data.cards.find(card => card.word === 'tea eggs').meaning, '茶葉蛋');
     assert.equal(generationRequests, 1);
-    r = await post(path, tc, { revision: updated.data.revision, maxAttempts: 1, recordingSeconds: 2,
+    assert.equal((await post(path, tc, { revision: updated.data.revision, chunkSize: 'extra' }, 'PATCH')).res.status, 400);
+    r = await post(path, tc, { revision: updated.data.revision, maxAttempts: 1, recordingSeconds: 2, chunkSize: 'medium',
       sentences: [{ id: second.id, text: second.text }, { id: first.id, text: 'Stanley bought some fruit.' }, { text: 'New question' }] }, 'PATCH');
     assert.equal(r.res.status, 200, JSON.stringify(r.data));
     assert.equal(generationRequests, 2);
     assert.equal((await post(path, tc, { revision: assignment.revision, title: '過期編輯' }, 'PATCH')).res.status, 409);
     const current = (await post('/api/sessions', sc, { code: assignment.code, deviceTestPassed: true })).data;
+    assert.equal(current.assignment.chunkSize, 'medium');
     assert.deepEqual(current.assignment.sentences.map(q => q.text), ['He was hungry.', 'Stanley bought some fruit.', 'New question']);
     assert.equal(current.assignment.sentences[0].maxAttempts, 1);
     assert.equal(old.assignment.sentences[0].text, first.text);
@@ -376,6 +381,8 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
       assert.equal((await call(qPath + '/accept', { method: 'POST', cookie: sc, headers: sessionHeaders })).res.status, 200);
     }
     assert.equal((await call(answerPath + '/complete', { method: 'POST', cookie: sc, headers: sessionHeaders })).res.status, 200);
+    const accepted = (await call(path, { cookie: tc })).data.sessions.find(row => row.id === old.sessionId);
+    assert.ok(accepted.answers.every(answer => answer.audioDuration === 1));
     const history = (await call('/api/student/submissions/' + old.sessionId, { cookie: sc })).data;
     assert.deepEqual(history.answers.map(q => q.text), [first.text, second.text]);
     const oldCards = (await post('/api/learning/context', sc, { sessionId: old.sessionId, questionId: first.id })).data.cards;
@@ -408,6 +415,10 @@ test('student accounts, ownership, feedback snapshots, ranges and submission tra
     assert.equal(mandarinCards[0].meaning, 'I');
     assert.equal(mandarinCards[0].examples.length, 2);
     const mandarinContext = { code: mandarin.code, questionId: mandarin.sentences[0].id };
+    oversizeChunk = true;
+    assert.equal((await post(mandarinPath + '/vocabulary', tc)).res.status, 202);
+    assert.match((await waitVocabulary(mandarinPath)).error, /語塊過大/);
+    oversizeChunk = false;
     omitToken = true;
     assert.equal((await post(mandarinPath + '/vocabulary', tc)).res.status, 202);
     assert.match((await waitVocabulary(mandarinPath)).error, /第 1 題漏標 1 個詞（我）/);

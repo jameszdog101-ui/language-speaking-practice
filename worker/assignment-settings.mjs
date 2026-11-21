@@ -1,15 +1,18 @@
 export const levels = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+export const chunkSizes = { small: 2, medium: 3, large: 5 };
 
 export function readLimits(body, assignment = {}) {
   const maxAttempts = Number(body.maxAttempts ?? assignment.max_attempts ?? 2);
   const recordingSeconds = Number(body.recordingSeconds ?? assignment.recording_seconds ?? 180);
   const cefr = body.cefr ?? assignment.cefr ?? 'A2';
+  const chunkSize = body.chunkSize ?? assignment.chunk_size ?? 'small';
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10)
     throw Error('錄製次數需為 1–10 次');
   if (!Number.isInteger(recordingSeconds) || recordingSeconds < 1 || recordingSeconds > 180)
     throw Error('每次錄音的時間上限需為 1–180 秒');
   if (!levels.includes(cefr)) throw Error('請選擇有效的 CEFR 等級');
-  return { maxAttempts, recordingSeconds, cefr };
+  if (typeof chunkSize !== 'string' || !Object.hasOwn(chunkSizes, chunkSize)) throw Error('請選擇有效的語塊大小');
+  return { maxAttempts, recordingSeconds, cefr, chunkSize };
 }
 
 export function readQuestions(input, current = []) {

@@ -23,24 +23,37 @@ export async function studentPortal(app, request, esc, join, history) {
   app.querySelector('#studentLogout').onclick=async()=>{await request('/api/student/logout',{method:'POST'}); studentPortal(app,request,esc,join,history);};
   const historyRoot = app.querySelector('#studentHistory');
   const tabs = document.createElement('div');
-  tabs.className = 'actions';
-  tabs.innerHTML = '<button type="button" class="secondary my-assignments">我的作業</button><button type="button" class="secondary my-vocabulary">單字庫</button>';
+  tabs.className = 'detail-tabs student-tabs';
+  tabs.setAttribute('role', 'tablist');
+  tabs.setAttribute('aria-label', '學生功能分頁');
+  tabs.innerHTML = '<button type="button" role="tab" aria-selected="true" class="detail-tab active my-assignments">我的作業</button><button type="button" role="tab" aria-selected="false" class="detail-tab my-vocabulary">單字庫</button>';
   historyRoot.before(tabs);
+  const myAssignmentsTab = tabs.querySelector('.my-assignments');
+  const myVocabularyTab = tabs.querySelector('.my-vocabulary');
+  const selectTab = activeTab => {
+    for (const tab of [myAssignmentsTab, myVocabularyTab]) {
+      const active = tab === activeTab;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', String(active));
+    }
+  };
   const assignmentsView = async () => {
+    selectTab(myAssignmentsTab);
     const assigned = document.createElement('div'), submissions = document.createElement('div');
+    assigned.className = 'assigned-section';
     historyRoot.replaceChildren(assigned, submissions);
     const pending = (async () => {
       try {
         const { assignments } = await request('/api/student/assigned');
         if (!assignments.length) return;
-        assigned.innerHTML = '<h3>老師指派的作業</h3>' + assignments.map(row => `<div class="item row"><span><b>${esc(row.title)}</b> · ${esc(row.teacher_name || '')} <span class="assignment-state ${row.completed_at ? 'is-complete' : 'is-open'}">${row.completed_at ? '已完成' : '未完成'}</span></span><button type="button" class="secondary" data-code="${esc(row.code)}">開啟作業</button></div>`).join('');
+        assigned.innerHTML = '<h3>老師指派的作業</h3><div class="list">' + assignments.map(row => `<div class="item assigned-row"><div class="assigned-info"><b>${esc(row.title)}</b><span class="muted">${esc(row.teacher_name || '')}</span><span class="assignment-state ${row.completed_at ? 'is-complete' : 'is-open'}">${row.completed_at ? '已完成' : '未完成'}</span></div><button type="button" class="secondary" data-code="${esc(row.code)}">開啟作業</button></div>`).join('') + '</div>';
         assigned.querySelectorAll('[data-code]').forEach(button => button.onclick = () => join(false, account, button.dataset.code));
       } catch (error) { assigned.textContent = error.message; }
     })();
     await Promise.all([pending, history?.(submissions, request, esc)]);
   };
-  tabs.querySelector('.my-assignments').onclick = assignmentsView;
-  tabs.querySelector('.my-vocabulary').onclick = () => showVocabulary(historyRoot, request);
+  myAssignmentsTab.onclick = assignmentsView;
+  myVocabularyTab.onclick = () => { selectTab(myVocabularyTab); showVocabulary(historyRoot, request); };
   await assignmentsView();
 }
 function passwordForm(app,request,done) {
