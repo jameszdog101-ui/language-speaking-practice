@@ -9,7 +9,7 @@ export async function prepareRecording(blob, maximumSeconds = MAX_RECORDING_SECO
   let decoded;
   try { decoded = await context.decodeAudioData(await blob.arrayBuffer()); }
   finally { await context.close(); }
-  const frames = Math.min(Math.round(decoded.duration * 32000), maximumSeconds * 32000);
+  const frames = Math.min(Math.round(decoded.length * 32000 / decoded.sampleRate), Math.floor(maximumSeconds * 32000));
   if (!frames) throw new Error('錄音內容為空白');
   const offline = new OfflineAudioContext(1, frames, 32000);
   const source = offline.createBufferSource();

@@ -57,7 +57,7 @@ export async function feedbackRoutes(req,env,url,h) {
   if(req.method==='PUT' && !match[3]) {
     const b=await bodyJson(req);
     if(b.version!==(existing?.version || 0))return fail('此份批改已在其他頁面更新，請重新載入',409);
-    const questions=(await env.DB.prepare('SELECT id FROM sentences WHERE assignment_id=? ORDER BY position').bind(session.assignment_id).all()).results;
+    const questions=(await env.DB.prepare('SELECT sentence_id id FROM answers WHERE session_id=? ORDER BY question_position').bind(session.id).all()).results;
     let data;try{data=validateFeedback(b.data || {},questions.map(x=>x.id));}catch(error){return fail(error.message);}
     for(const audioId of feedbackAudioIds(data))if(!await env.DB.prepare('SELECT id FROM feedback_audio WHERE id=? AND session_id=?').bind(audioId,sessionId).first())return fail('錄音不屬於這份提交');
     const result=await env.DB.prepare(`INSERT INTO feedback(session_id,draft_json,version,updated_at) VALUES(?,?,1,?) ON CONFLICT(session_id) DO UPDATE SET draft_json=excluded.draft_json,version=feedback.version+1,updated_at=excluded.updated_at WHERE feedback.version=?`).bind(sessionId,JSON.stringify(data),new Date().toISOString(),b.version).run();

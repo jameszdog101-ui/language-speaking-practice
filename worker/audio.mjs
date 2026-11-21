@@ -23,7 +23,7 @@ export function wavDuration(buffer) {
 }
 
 export async function audioResponse(req, bucket, meta) {
-  const headers = { 'content-type': meta.mime_type, 'cache-control': 'private, no-store', 'accept-ranges': 'bytes' };
+  const headers = { 'content-type': meta.mime_type, 'cache-control': 'private, no-store', 'accept-ranges': 'bytes', 'x-content-type-options': 'nosniff' };
   const range = req.headers.get('range');
   const size = meta.byte_size;
   if (range) {

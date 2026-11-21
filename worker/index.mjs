@@ -1,9 +1,13 @@
 import { feedbackRoutes, deleteFeedbackAudio, purgeUnusedFeedbackAudio } from './feedback.mjs';
 import { historyRoutes } from './history.mjs';
-import { studentServices } from './students.mjs';
+import { purgeStudentAudio, studentServices } from './students.mjs';
 import { dictionary } from './dictionary.mjs';
 import { submissionRoutes, purgeSubmissions } from './submissions.mjs';
 import { wavDuration, audioResponse } from './audio.mjs';
+import { readLimits, readQuestions, rosterStatements } from './assignment-settings.mjs';
+import { rosterRoutes } from './rosters.mjs';
+import { cardWrites, claimVocabulary, finishVocabulary, learningRoutes, vocabularyStatus } from './learning.mjs';
+import { generateVocabulary, splitAssignmentText } from './gemini.mjs';
 const MAX_AUDIO = 15 * 1024 * 1024;
 const AUDIO_TYPES = new Set([
   "audio/webm",
@@ -34,11 +38,18 @@ export function publicAssignment(a, sentences) {
     endsAt: a.ends_at || null,
     deidentifyVoice: Boolean(a.deidentify_voice),
     transformVersion: a.transform_version || null,
+    revision: a.revision ?? 1,
+    publicationState: a.publication_state ?? 'published',
+    maxAttempts: a.max_attempts,
+    recordingSeconds: a.recording_seconds ?? 180,
+    cefr: a.cefr ?? 'A2',
+    chunkSize: a.chunk_size ?? 'small',
     sentences: sentences.map((s) => ({
       id: s.id,
       text: s.text,
       pinyin: s.pinyin,
       maxAttempts: s.max_attempts ?? s.maxAttempts ?? a.max_attempts,
+      recordingSeconds: s.recording_seconds ?? s.recordingSeconds ?? a.recording_seconds ?? 180,
     })),
   };
 }
@@ -70,7 +81,7 @@ function token(bytes = 24) {
     .replaceAll("/", "_")
     .replaceAll("=", "");
 }
-async function hash(value) {
+export async function hash(value) {
   const data = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", data);
   return [...new Uint8Array(digest)]
@@ -154,7 +165,7 @@ async function bodyJson(req) {
 }
 async function assignmentByCode(env, code) {
   return env.DB.prepare(
-    "SELECT * FROM assignments WHERE code = ? AND deleted_at IS NULL",
+    "SELECT * FROM assignments WHERE code = ? AND deleted_at IS NULL AND publication_state='published'",
   )
     .bind(String(code || "").toUpperCase())
     .first();
@@ -162,7 +173,7 @@ async function assignmentByCode(env, code) {
 async function sentences(env, assignmentId) {
   return (
     await env.DB.prepare(
-      "SELECT id,text,pinyin,position,max_attempts FROM sentences WHERE assignment_id=? ORDER BY position",
+      "SELECT id,text,pinyin,position,max_attempts,recording_seconds FROM sentences WHERE assignment_id=? ORDER BY position",
     )
       .bind(assignmentId)
       .all()
@@ -197,6 +208,7 @@ function ext(type) {
           : "webm";
 }
 function assignmentStatus(a, now = new Date().toISOString()) {
+  if (a.publication_state === 'draft') return 'draft';
   if (a.starts_at && a.starts_at > now) return "upcoming";
   if (a.ends_at && a.ends_at <= now) return "ended";
   return "ongoing";
@@ -222,6 +234,8 @@ async function purgeAssignments(env, ids) {
   for (const assignmentId of ids) {
     const submissions=(await env.DB.prepare("SELECT id FROM sessions WHERE assignment_id=?").bind(assignmentId).all()).results;
     await deleteFeedbackAudio(env,submissions.map(s=>s.id));
+    const questionAudio = await env.DB.prepare('SELECT qa.r2_key FROM question_audio qa JOIN sentences q ON q.id=qa.sentence_id WHERE q.assignment_id=?').bind(assignmentId).all();
+    for (const item of questionAudio.results) await env.AUDIO.delete(item.r2_key);
     audio += await deleteAttemptObjects(
       env,
       "session_id IN (SELECT id FROM sessions WHERE assignment_id=?)",
@@ -278,9 +292,20 @@ async function purgeExpired(env) {
 }
 
 const students = studentServices({response, fail, id, token, hash, passwordHash, cookie, teacher, bodyJson});
-async function api(req, env, url) {
-  const lookup = await dictionary(req, url, response, fail); if (lookup) return lookup;
+async function api(req, env, url, ctx) {
   if (!['GET','HEAD','OPTIONS'].includes(req.method) && req.headers.get('origin') && req.headers.get('origin') !== url.origin) return fail('禁止跨站操作', 403);
+  const learningResult = await learningRoutes(req, env, url, { teacher, student: students.student, canEdit, response, fail, bodyJson, hash, authorizeSession, waitUntil: promise => ctx?.waitUntil(promise) });
+  if (learningResult) return learningResult;
+  const rosterResult = await rosterRoutes(req, env, url, { teacher, student: students.student, response, fail });
+  if (rosterResult) return rosterResult;
+  const lookup = await dictionary(req, url, response, fail); if (lookup) return lookup;
+  if (req.method === 'POST' && url.pathname === '/api/teacher/assignments/split') {
+    const t = await teacher(req, env);
+    if (!t) return fail('請先登入教師帳號', 401);
+    try {
+      return response({ questions: await splitAssignmentText(env, t.id, await bodyJson(req)) });
+    } catch (error) { return fail(error.message, 422); }
+  }
   const studentResult = await students.routes(req, env, url); if(studentResult) return studentResult;
   const feedbackResult = await feedbackRoutes(req,env,url,{teacher,student:students.student,canEdit,response,fail,bodyJson,id}); if(feedbackResult) return feedbackResult;
   const historyResult = await historyRoutes(req,env,url,{student:students.student,response,fail}); if(historyResult) return historyResult;
@@ -501,44 +526,44 @@ async function api(req, env, url) {
   }
   if (url.pathname === "/api/admin/trash" && req.method === "GET") {
     const t = await teacher(req, env);
-    if (!isSuper(t)) return fail("僅最高管理員可使用", 403);
+    if (!t) return fail("請先登入", 401);
     const assignments = (
         await env.DB.prepare(
-          `SELECT a.id,a.title,a.deleted_at,a.purge_after,t.display_name teacher_name,COUNT(DISTINCT s.id) submissions,COUNT(at.id) audio_count FROM assignments a LEFT JOIN teachers t ON t.id=a.teacher_id LEFT JOIN sessions s ON s.assignment_id=a.id LEFT JOIN attempts at ON at.session_id=s.id WHERE a.deleted_at IS NOT NULL GROUP BY a.id ORDER BY a.deleted_at DESC`,
-        ).all()
+          `SELECT a.id,a.title,a.deleted_at,a.purge_after,t.display_name teacher_name,COUNT(DISTINCT s.id) submissions,COUNT(at.id) audio_count FROM assignments a LEFT JOIN teachers t ON t.id=a.teacher_id LEFT JOIN sessions s ON s.assignment_id=a.id LEFT JOIN attempts at ON at.session_id=s.id WHERE a.deleted_at IS NOT NULL AND (? OR a.teacher_id=?) GROUP BY a.id ORDER BY a.deleted_at DESC`,
+        ).bind(Number(isSuper(t)), t.id).all()
       ).results,
       audio = (
         await env.DB.prepare(
-          `SELECT a.id assignment_id,a.title,MIN(at.deleted_at) deleted_at,MIN(at.purge_after) purge_after,COUNT(at.id) audio_count FROM attempts at JOIN sessions s ON s.id=at.session_id JOIN assignments a ON a.id=s.assignment_id WHERE at.deleted_at IS NOT NULL AND a.deleted_at IS NULL GROUP BY a.id ORDER BY deleted_at DESC`,
-        ).all()
+          `SELECT a.id assignment_id,a.title,MIN(at.deleted_at) deleted_at,MIN(at.purge_after) purge_after,COUNT(at.id) audio_count FROM attempts at JOIN sessions s ON s.id=at.session_id JOIN assignments a ON a.id=s.assignment_id WHERE at.deleted_at IS NOT NULL AND a.deleted_at IS NULL AND (? OR a.teacher_id=?) GROUP BY a.id ORDER BY deleted_at DESC`,
+        ).bind(Number(isSuper(t)), t.id).all()
       ).results;
     return response({ assignments, audio });
   }
   if (url.pathname === "/api/admin/trash" && req.method === "POST") {
     const t = await teacher(req, env);
-    if (!isSuper(t)) return fail("僅最高管理員可使用", 403);
+    if (!t) return fail("請先登入", 401);
     const b = await bodyJson(req),
       ids = Array.isArray(b.assignmentIds)
         ? [...new Set(b.assignmentIds.map(String))]
         : [],
       scope = b.scope;
     if (!ids.length || !["all", "audio"].includes(scope))
-      return fail("請選擇已截止作業與刪除範圍");
+      return fail("請選擇作業與刪除範圍");
     const marks = ids.map(() => "?").join(","),
       now = new Date().toISOString(),
       purge = new Date(Date.now() + 30 * 86400000).toISOString(),
       eligible = (
         await env.DB.prepare(
-          `SELECT id FROM assignments WHERE id IN (${marks}) AND deleted_at IS NULL AND ends_at IS NOT NULL AND ends_at<=?`,
+          `SELECT id FROM assignments WHERE id IN (${marks}) AND deleted_at IS NULL AND (? OR teacher_id=?)`,
         )
-          .bind(...ids, now)
+          .bind(...ids, Number(isSuper(t)), t.id)
           .all()
       ).results.map((x) => x.id);
-    if (!eligible.length) return fail("只有已截止作業可放入垃圾桶");
+    if (eligible.length !== ids.length) return fail("找不到作業或無權操作", 404);
     const okMarks = eligible.map(() => "?").join(",");
     if (scope === "all")
       await env.DB.prepare(
-        `UPDATE assignments SET deleted_at=?,purge_after=?,deleted_by=? WHERE id IN (${okMarks})`,
+        `UPDATE assignments SET deleted_at=?,purge_after=?,deleted_by=? WHERE id IN (${okMarks}) AND deleted_at IS NULL`,
       )
         .bind(now, purge, t.id, ...eligible)
         .run();
@@ -552,7 +577,7 @@ async function api(req, env, url) {
   }
   if (url.pathname === "/api/admin/trash/restore" && req.method === "POST") {
     const t = await teacher(req, env);
-    if (!isSuper(t)) return fail("僅最高管理員可使用", 403);
+    if (!t) return fail("請先登入", 401);
     const b = await bodyJson(req),
       ids = Array.isArray(b.assignmentIds)
         ? [...new Set(b.assignmentIds.map(String))]
@@ -561,17 +586,21 @@ async function api(req, env, url) {
     if (!ids.length || !["all", "audio"].includes(scope))
       return fail("請選擇項目");
     const marks = ids.map(() => "?").join(",");
+    const ownerBindings = [Number(isSuper(t)), t.id];
+    const allowed = await env.DB.prepare(`SELECT COUNT(*) n FROM assignments WHERE id IN (${marks}) AND (? OR teacher_id=?)`).bind(...ids, ...ownerBindings).first();
+    if (allowed.n !== ids.length) return fail("找不到作業或無權操作", 404);
+    const now = new Date().toISOString();
     if (scope === "all")
       await env.DB.prepare(
-        `UPDATE assignments SET deleted_at=NULL,purge_after=NULL,deleted_by=NULL WHERE id IN (${marks})`,
+        `UPDATE assignments SET deleted_at=NULL,purge_after=NULL,deleted_by=NULL WHERE id IN (${marks}) AND purge_after>?`,
       )
-        .bind(...ids)
+        .bind(...ids, now)
         .run();
     else
       await env.DB.prepare(
-        `UPDATE attempts SET deleted_at=NULL,purge_after=NULL WHERE session_id IN (SELECT id FROM sessions WHERE assignment_id IN (${marks}))`,
+        `UPDATE attempts SET deleted_at=NULL,purge_after=NULL WHERE session_id IN (SELECT id FROM sessions WHERE assignment_id IN (${marks})) AND purge_after>?`,
       )
-        .bind(...ids)
+        .bind(...ids, now)
         .run();
     return response({ ok: true });
   }
@@ -634,13 +663,18 @@ async function api(req, env, url) {
       now = new Date().toISOString(),
       cutoff = days ? new Date(Date.now() - days * 86400000).toISOString() : "";
     const ownership = isSuper(t) ? "1=1" : "a.teacher_id=?",
-      where = `a.deleted_at IS NULL AND ${ownership} AND (?='' OR a.language=?) AND (?='' OR a.created_at>=?) AND (?='' OR (?='upcoming' AND a.starts_at IS NOT NULL AND a.starts_at>?) OR (?='ended' AND a.ends_at IS NOT NULL AND a.ends_at<=?) OR (?='ongoing' AND (a.starts_at IS NULL OR a.starts_at<=?) AND (a.ends_at IS NULL OR a.ends_at>?))) AND (a.title LIKE ? OR a.instructions LIKE ? OR EXISTS(SELECT 1 FROM sentences sx WHERE sx.assignment_id=a.id AND (sx.text LIKE ? OR sx.pinyin LIKE ?)))`,
+      where = `a.deleted_at IS NULL AND ${ownership} AND (?='' OR a.language=?) AND (?='' OR a.created_at>=?)
+        AND (?='' OR (?='draft' AND a.publication_state='draft')
+          OR (a.publication_state='published' AND ((?='upcoming' AND a.starts_at>?) OR (?='ended' AND a.ends_at<=?)
+            OR (?='ongoing' AND (a.starts_at IS NULL OR a.starts_at<=?) AND (a.ends_at IS NULL OR a.ends_at>?)))))
+        AND (a.title LIKE ? OR a.instructions LIKE ? OR EXISTS(SELECT 1 FROM sentences sx WHERE sx.assignment_id=a.id AND (sx.text LIKE ? OR sx.pinyin LIKE ?)))`,
       values = [
         ...(isSuper(t) ? [] : [t.id]),
         language,
         language,
         cutoff,
         cutoff,
+        status,
         status,
         status,
         now,
@@ -672,6 +706,7 @@ async function api(req, env, url) {
       assignments: rows.map((a) => ({
         id: a.id,
         code: a.code,
+        publicationState: a.publication_state,
         title: a.title,
         instructions: a.instructions,
         language: a.language,
@@ -706,7 +741,8 @@ async function api(req, env, url) {
     if (!a || !canEdit(t, a)) return fail("找不到作業或無權檢視", 404);
     const ss = (
       await env.DB.prepare(
-        "SELECT * FROM sessions WHERE assignment_id=? AND deleted_at IS NULL ORDER BY started_at DESC",
+        `SELECT s.*, EXISTS(SELECT 1 FROM student_avatars sa WHERE sa.student_id=s.student_account_id) has_avatar
+        FROM sessions s WHERE s.assignment_id=? AND s.deleted_at IS NULL ORDER BY s.started_at DESC`,
       )
         .bind(a.id)
         .all()
@@ -714,31 +750,52 @@ async function api(req, env, url) {
     for (const s of ss) {
       s.answers = (
         await env.DB.prepare(
-          `SELECT an.sentence_id,an.accepted_attempt,COUNT(at.id) attempts,MAX(CASE WHEN at.attempt_number=an.accepted_attempt THEN at.id END) audio_id FROM answers an LEFT JOIN attempts at ON at.session_id=an.session_id AND at.sentence_id=an.sentence_id AND at.deleted_at IS NULL WHERE an.session_id=? GROUP BY an.sentence_id,an.accepted_attempt`,
+          `SELECT an.sentence_id,an.question_text,an.question_pinyin,an.accepted_attempt,COUNT(at.id) attempts,
+            MAX(CASE WHEN at.attempt_number=an.accepted_attempt THEN at.id END) audio_id,
+            MAX(CASE WHEN at.attempt_number=an.accepted_attempt THEN at.mime_type END) audio_type,
+            MAX(CASE WHEN at.attempt_number=an.accepted_attempt THEN at.duration_seconds END) audio_duration
+            FROM answers an LEFT JOIN attempts at ON at.session_id=an.session_id AND at.sentence_id=an.sentence_id AND at.deleted_at IS NULL
+            WHERE an.session_id=? GROUP BY an.sentence_id ORDER BY an.question_position`,
         )
           .bind(s.id)
           .all()
       ).results.map((x) => ({
         sentenceId: x.sentence_id,
+        text: x.question_text,
+        pinyin: x.question_pinyin,
         attempts: x.attempts,
         acceptedAttempt: x.accepted_attempt,
         audioUrl: x.audio_id ? `/api/teacher/audio/${x.audio_id}` : null,
+        audioType: x.audio_type,
+        audioDuration: x.audio_duration,
       }));
     }
+    const questions = await sentences(env, a.id);
+    const recipients = await env.DB.prepare('SELECT student_id FROM assignment_recipients WHERE assignment_id=?').bind(a.id).all();
+    const vocabulary = vocabularyStatus(a);
     return response({
       assignment: {
-        ...publicAssignment(a, await sentences(env, a.id)),
+        ...publicAssignment(a, questions),
+        questionOverrides: Object.fromEntries(questions.map(q => [q.id, { maxAttempts: q.max_attempts, recordingSeconds: q.recording_seconds }])),
+        recipientIds: recipients.results.map(row => row.student_id),
         language: a.language,
         teacherName: a.teacher_name || "系統舊作業",
         teacherEmail: a.teacher_email,
+        teacherId: a.teacher_id,
+        vocabularyReady: a.vocabulary_version >= 2,
+        canEditVocabulary: t.id === a.teacher_id && a.vocabulary_version >= 2,
+        vocabularyGenerating: vocabulary.generating,
+        vocabularyError: vocabulary.error,
         canEdit: true,
-        hasSubmissions: Boolean(await env.DB.prepare('SELECT 1 FROM sessions WHERE assignment_id=? LIMIT 1').bind(a.id).first()),
+        hasSubmissions: Boolean(a.identity_locked),
       },
       sessions: ss.map((s) => ({
         id: s.id,
         name: s.name,
         studentId: s.student_id,
         anonymousId: s.anonymous_id,
+        avatarUrl: s.has_avatar && !s.anonymous_id && !a.anonymous && a.identity_mode !== 'anonymous'
+          ? `/api/teacher/session-avatar/${s.id}` : null,
         startedAt: s.started_at,
         completedAt: s.completed_at,
         answers: s.answers,
@@ -755,8 +812,8 @@ async function api(req, env, url) {
       .first();
     if (!a || !canEdit(t, a)) return fail("找不到作業或無權編輯", 404);
     const b = await bodyJson(req),
-      starts = isoOrNull(b.startsAt),
-      ends = isoOrNull(b.endsAt),
+      starts = b.startsAt === undefined ? a.starts_at : isoOrNull(b.startsAt),
+      ends = b.endsAt === undefined ? a.ends_at : isoOrNull(b.endsAt),
       title = String(b.title ?? a.title).trim(),
       instructions = String(b.instructions ?? a.instructions),
       language = String(b.language ?? a.language),
@@ -775,69 +832,80 @@ async function api(req, env, url) {
       return fail("身分資料模式錯誤");
     if (starts && ends && starts >= ends)
       return fail("結束時間必須晚於開始時間");
-    const hasSessions = await env.DB.prepare(
-        "SELECT 1 FROM sessions WHERE assignment_id=? LIMIT 1",
-      )
-        .bind(a.id)
-        .first(),
+    const hasSessions = Boolean(a.identity_locked),
       oldMode = a.identity_mode || (a.anonymous ? "anonymous" : "full");
     if (
       hasSessions &&
       (deidentify !== Boolean(a.deidentify_voice) || identityMode !== oldMode)
     )
       return fail("已有學生開始作答，無法變更匿名或聲音去識別化設定", 409);
-    if (Array.isArray(b.sentences)) {
-      if (hasSessions)
-        return fail("已有學生開始作答，只能修改基本資料與開放時間", 409);
-      if (
-        !b.sentences.length ||
-        b.sentences.some(
-          (s) =>
-            !String(s.text || "").trim() || !validMaxAttempts(s.maxAttempts),
-        )
-      )
-        return fail("題目文字與錄製次數格式錯誤");
-      const statements = [
-        env.DB.prepare("DELETE FROM sentences WHERE assignment_id=?").bind(
-          a.id,
-        ),
-      ];
-      for (let i = 0; i < b.sentences.length; i++) {
-        const s = b.sentences[i];
-        statements.push(
-          env.DB.prepare(
-            "INSERT INTO sentences(id,assignment_id,position,text,pinyin,max_attempts) VALUES(?,?,?,?,?,?)",
-          ).bind(
-            id("q"),
-            a.id,
-            i,
-            String(s.text).trim(),
-            String(s.pinyin || ""),
-            Number(s.maxAttempts),
-          ),
-        );
-      }
-      await env.DB.batch(statements);
+    if (b.revision !== undefined && b.revision !== a.revision)
+      return fail('作業已更新，請重新載入後再修改', 409);
+    if (a.vocabulary_job_until && a.vocabulary_job_until > new Date().toISOString())
+      return fail('語塊卡正在生成，請稍後再編輯', 409);
+    let limits, questions, recipients;
+    const oldQuestions = await sentences(env, a.id);
+    try {
+      limits = readLimits(b, a);
+      questions = b.sentences === undefined ? null : readQuestions(b.sentences, oldQuestions);
+      recipients = await rosterStatements(env, a.id, a.teacher_id, b.recipientIds, identityMode);
+    } catch (error) { return fail(error.message); }
+    const changes = [];
+    if (questions) {
+      changes.push(env.DB.prepare('UPDATE sentences SET position=-position-1 WHERE assignment_id=?').bind(a.id));
+      questions.forEach((q, index) => {
+        const existingId = q.id;
+        q.id ||= id('q');
+        changes.push(existingId
+          ? env.DB.prepare('UPDATE sentences SET position=?,text=?,pinyin=?,max_attempts=?,recording_seconds=? WHERE id=? AND assignment_id=?')
+            .bind(index, q.text, q.pinyin, q.maxAttempts, q.recordingSeconds, q.id, a.id)
+          : env.DB.prepare('INSERT INTO sentences(id,assignment_id,position,text,pinyin,max_attempts,recording_seconds) VALUES(?,?,?,?,?,?,?)')
+            .bind(q.id, a.id, index, q.text, q.pinyin, q.maxAttempts, q.recordingSeconds));
+      });
     }
-    await env.DB.prepare(
-      "UPDATE assignments SET title=?,instructions=?,language=?,starts_at=?,ends_at=?,deidentify_voice=?,transform_version=?,identity_mode=?,anonymous=? WHERE id=?",
-    )
-      .bind(
-        title,
-        instructions,
-        language,
-        starts,
-        ends,
-        deidentify ? 1 : 0,
-        deidentify ? TRANSFORM_VERSION : null,
-        identityMode,
-        identityMode === "anonymous" ? 1 : 0,
-        a.id,
-      )
-      .run();
+    const previousText = new Map(oldQuestions.map(q => [q.id, q.text]));
+    const chunkChanged = limits.chunkSize !== a.chunk_size;
+    const levelChanged = language !== a.language || limits.cefr !== a.cefr || chunkChanged;
+    const nextQuestions = questions ?? oldQuestions;
+    const changedQuestions = nextQuestions.filter(q => levelChanged || previousText.get(q.id) !== q.text);
+    let lease = null, vocabularyVersion = a.vocabulary_version;
+    if (a.publication_state === 'published' && (vocabularyVersion >= 2 || b.generateVocabulary === true) && changedQuestions.length) {
+      if (t.id !== a.teacher_id) return fail('請由作業發布教師更新需要重新生成語塊卡的內容', 403);
+      lease = await claimVocabulary(env, a);
+      if (!lease) return fail('語塊卡正在生成或作業已更新，請重新讀取', 409);
+      try {
+        const next = { language, cefr: limits.cefr, chunk_size: limits.chunkSize,
+          vocabulary_version: chunkChanged ? vocabularyVersion + 1 : Math.max(2, vocabularyVersion) };
+        const output = await generateVocabulary(env, t.id, next, vocabularyVersion === 1 ? nextQuestions : changedQuestions);
+        changes.push(...(await cardWrites(env, hash, next, output)).statements);
+        vocabularyVersion = next.vocabulary_version;
+      } catch (error) {
+        await finishVocabulary(env, a.id, lease, error.message);
+        return fail(error.message, 422);
+      }
+    }
+    const update = env.DB.prepare(
+      `UPDATE assignments SET title=?,instructions=?,language=?,starts_at=?,ends_at=?,deidentify_voice=?,
+        transform_version=?,identity_mode=?,anonymous=?,max_attempts=?,recording_seconds=?,cefr=?,chunk_size=?,vocabulary_version=?,
+        vocabulary_job_token=NULL,vocabulary_job_until=NULL,vocabulary_job_error=NULL,
+        revision=CASE WHEN (? IS NOT NULL AND vocabulary_job_token=?)
+          OR (? IS NULL AND (vocabulary_job_until IS NULL OR vocabulary_job_until<=?)) THEN ? ELSE revision END WHERE id=?`
+    ).bind(title, instructions, language, starts, ends, Number(deidentify),
+      deidentify ? TRANSFORM_VERSION : null, identityMode, Number(identityMode === 'anonymous'),
+      limits.maxAttempts, limits.recordingSeconds, limits.cefr, limits.chunkSize, vocabularyVersion,
+      lease, lease, lease, new Date().toISOString(), a.revision + 1, a.id);
+    try { await env.DB.batch([update, ...changes, ...recipients]); }
+    catch (error) {
+      if (lease) await finishVocabulary(env, a.id, lease);
+      if (/assignment_(revision_conflict|identity_locked)/.test(String(error)))
+        return fail('作業狀態已更新，請重新載入後再修改', 409);
+      throw error;
+    }
     return response({
       ok: true,
-      status: assignmentStatus({ starts_at: starts, ends_at: ends }),
+      status: assignmentStatus({ starts_at: starts, ends_at: ends, publication_state: a.publication_state }),
+      sentences: questions?.map(q => ({ id: q.id })) || [],
+      revision: a.revision + 1,
     });
   }
   teacherMatch = url.pathname.match(/^\/api\/teacher\/audio\/([^/]+)$/);
@@ -858,36 +926,41 @@ async function api(req, env, url) {
     if (!owner) return fail("請先登入", 401);
     const b = await bodyJson(req),
       language = String(b.language || ""),
-      starts = b.startsAt ? new Date(b.startsAt).toISOString() : null,
-      ends = b.endsAt ? new Date(b.endsAt).toISOString() : null,
+      starts = isoOrNull(b.startsAt),
+      ends = isoOrNull(b.endsAt),
       deidentify = b.deidentifyVoice === true,
       identityMode = String(b.identityMode || "full");
+    const draft = b.generateOnPublish === true;
+    const creationKey = draft ? String(b.creationKey || '') : null;
+    if (draft && !/^[a-f0-9-]{36}$/i.test(creationKey)) return fail('無法辨識此發布請求，請重新進入建立頁面');
+    const previousDraft = () => env.DB.prepare('SELECT * FROM assignments WHERE teacher_id=? AND creation_key=? AND deleted_at IS NULL').bind(owner.id, creationKey).first();
+    if (draft) {
+      const previous = await previousDraft();
+      if (previous) return response(publicAssignment(previous, await sentences(env, previous.id)));
+    }
     if (!["zh-TW", "en"].includes(language)) return fail("請選擇中文或英文課");
     if (!["full", "name_only", "anonymous"].includes(identityMode))
       return fail("身分資料模式錯誤");
     if (starts && ends && starts >= ends)
       return fail("結束時間必須晚於開始時間");
     if (!String(b.title || "").trim()) return fail("請輸入作業名稱");
-    if (
-      !Array.isArray(b.sentences) ||
-      !b.sentences.length ||
-      b.sentences.some((s) => !String(s.text || "").trim())
-    )
-      return fail("至少需要一個非空白句子");
-    if (b.sentences.some((s) => !validMaxAttempts(s.maxAttempts)))
-      return fail("每題錄製次數必須為 1–10 的整數");
     const assignmentId = id("a"),
       adminKey = token(),
       now = new Date().toISOString();
+    let limits, questions, recipients;
+    try {
+      limits = readLimits(b);
+      questions = readQuestions(b.sentences);
+      recipients = await rosterStatements(env, assignmentId, owner.id, b.recipientIds, identityMode);
+    } catch (error) { return fail(error.message); }
     let courseCode;
     for (let n = 0; n < 5; n++) {
       courseCode = code();
-      if (!(await assignmentByCode(env, courseCode))) break;
+      if (!(await env.DB.prepare('SELECT 1 FROM assignments WHERE code=?').bind(courseCode).first())) break;
     }
-    const legacyMax = Number(b.sentences[0].maxAttempts),
-      statements = [
+    const statements = [
         env.DB.prepare(
-          "INSERT INTO assignments(id,code,admin_key_hash,title,instructions,anonymous,max_attempts,created_at,teacher_id,language,starts_at,ends_at,deidentify_voice,transform_version,identity_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO assignments(id,code,admin_key_hash,title,instructions,anonymous,max_attempts,created_at,teacher_id,language,starts_at,ends_at,deidentify_voice,transform_version,identity_mode,recording_seconds,cefr,chunk_size,publication_state,creation_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         ).bind(
           assignmentId,
           courseCode,
@@ -895,7 +968,7 @@ async function api(req, env, url) {
           String(b.title).trim(),
           String(b.instructions || ""),
           identityMode === "anonymous" ? 1 : 0,
-          legacyMax,
+          limits.maxAttempts,
           now,
           owner.id,
           language,
@@ -904,22 +977,33 @@ async function api(req, env, url) {
           deidentify ? 1 : 0,
           deidentify ? TRANSFORM_VERSION : null,
           identityMode,
+          limits.recordingSeconds,
+          limits.cefr,
+          limits.chunkSize,
+          draft ? 'draft' : 'published',
+          creationKey,
         ),
       ];
-    const qs = b.sentences.map((s, i) => ({
+    const qs = questions.map((s, i) => ({
       id: id("q"),
       text: String(s.text).trim(),
       pinyin: String(s.pinyin || ""),
       position: i,
-      maxAttempts: Number(s.maxAttempts),
+      maxAttempts: s.maxAttempts,
+      recordingSeconds: s.recordingSeconds,
     }));
     for (const q of qs)
       statements.push(
         env.DB.prepare(
-          "INSERT INTO sentences(id,assignment_id,position,text,pinyin,max_attempts) VALUES(?,?,?,?,?,?)",
-        ).bind(q.id, assignmentId, q.position, q.text, q.pinyin, q.maxAttempts),
+          "INSERT INTO sentences(id,assignment_id,position,text,pinyin,max_attempts,recording_seconds) VALUES(?,?,?,?,?,?,?)",
+        ).bind(q.id, assignmentId, q.position, q.text, q.pinyin, q.maxAttempts, q.recordingSeconds),
       );
-    await env.DB.batch(statements);
+    try { await env.DB.batch([...statements, ...recipients]); }
+    catch (error) {
+      const previous = draft && await previousDraft();
+      if (previous) return response(publicAssignment(previous, await sentences(env, previous.id)));
+      throw error;
+    }
     const a = await env.DB.prepare("SELECT * FROM assignments WHERE id=? AND deleted_at IS NULL")
       .bind(assignmentId)
       .first();
@@ -928,14 +1012,16 @@ async function api(req, env, url) {
       201,
     );
   }
-  let m = url.pathname.match(/^\/api\/assignments\/code\/([A-Z0-9]+)$/i);
-  if (req.method === "GET" && m) {
-    const a = await assignmentByCode(env, m[1]);
+  const codeRoute = "/api/assignments/code";
+  if (req.method === "GET" && (url.pathname === codeRoute || url.pathname.startsWith(codeRoute + "/"))) {
+    const courseCode = url.pathname.slice(codeRoute.length + 1);
+    if (!/^[A-Za-z0-9]{6}$/.test(courseCode)) return fail("請輸入 6 位英文字母或數字的課程代碼。");
+    const a = await assignmentByCode(env, courseCode);
     return a
       ? response(publicAssignment(a, await sentences(env, a.id)))
       : fail("找不到課程代碼", 404);
   }
-  m = url.pathname.match(/^\/api\/assignments\/([^/]+)$/);
+  let m = url.pathname.match(/^\/api\/assignments\/([^/]+)$/);
   if (req.method === "PUT" && m) {
     const a = await env.DB.prepare("SELECT * FROM assignments WHERE id=? AND deleted_at IS NULL")
       .bind(m[1])
@@ -953,10 +1039,12 @@ async function api(req, env, url) {
     const b = await bodyJson(req),
       max = Number(b.maxAttempts);
     if (!validMaxAttempts(max)) return fail("錄製次數必須為 1–10 的整數");
-    await env.DB.prepare("UPDATE assignments SET max_attempts=? WHERE id=?")
-      .bind(max, a.id)
+    const updated = await env.DB.prepare("UPDATE assignments SET max_attempts=?,revision=revision+1 WHERE id=? AND revision=? AND identity_locked=0 AND deleted_at IS NULL")
+      .bind(max, a.id, a.revision)
       .run();
+    if (!updated.meta.changes) return fail('已有學生開始作答或作業已變更，請重新載入', 409);
     a.max_attempts = max;
+    a.revision++;
     return response(publicAssignment(a, await sentences(env, a.id)));
   }
   m = url.pathname.match(/^\/api\/assignments\/([^/]+)\/submissions$/);
@@ -1002,6 +1090,41 @@ async function api(req, env, url) {
       })),
     });
   }
+  const resume = /^\/api\/student\/resume\/([^/]+)$/.exec(url.pathname);
+  if (req.method === 'POST' && resume) {
+    const account = await students.student(req, env);
+    if (!account) return fail('請先登入學生帳號', 401);
+    const s = await env.DB.prepare(`SELECT s.id,s.assignment_id,s.assignment_language,s.assignment_cefr,s.voice_profile
+      FROM sessions s JOIN assignments a ON a.id=s.assignment_id
+      WHERE s.id=? AND s.student_account_id=? AND s.completed_at IS NULL AND s.deleted_at IS NULL AND a.deleted_at IS NULL`).bind(resume[1], account.id).first();
+    if (!s) return fail('找不到可繼續的作答', 404);
+    const a = await env.DB.prepare('SELECT * FROM assignments WHERE id=? AND deleted_at IS NULL').bind(s.assignment_id).first();
+    if (!a) return fail('作業已移入垃圾桶', 404);
+    const clock = new Date().toISOString(), newToken = token();
+    const saved = await env.DB.prepare(`UPDATE sessions SET token_hash=? WHERE id=? AND completed_at IS NULL AND deleted_at IS NULL
+      AND EXISTS (SELECT 1 FROM assignments a WHERE a.id=sessions.assignment_id AND a.deleted_at IS NULL AND (a.ends_at IS NULL OR a.ends_at>?))`)
+      .bind(await hash(newToken), s.id, clock).run();
+    if (!saved.meta.changes) return fail('作業已完成、截止或移入垃圾桶', 409);
+    const { results: questions } = await env.DB.prepare(`SELECT an.sentence_id id,an.question_text text,an.question_pinyin pinyin,
+      an.max_attempts_snapshot max_attempts,an.recording_seconds_snapshot recording_seconds,an.accepted_attempt,
+      (SELECT COUNT(*) FROM attempts at WHERE at.session_id=an.session_id AND at.sentence_id=an.sentence_id) attempts,
+      (SELECT id FROM attempts at WHERE at.session_id=an.session_id AND at.sentence_id=an.sentence_id AND at.deleted_at IS NULL
+        AND (an.accepted_attempt IS NULL OR at.attempt_number=an.accepted_attempt) ORDER BY at.attempt_number DESC LIMIT 1) audio_id
+      FROM answers an WHERE an.session_id=? ORDER BY an.question_position`).bind(s.id).all();
+    return response({
+      sessionId: s.id, sessionToken: newToken, voiceProfile: s.voice_profile, student: { id: account.id },
+      assignment: publicAssignment({ ...a, language: s.assignment_language, cefr: s.assignment_cefr }, questions),
+      progress: questions.map(q => ({ id: q.id, attempts: q.attempts, accepted: q.accepted_attempt != null,
+        audioUrl: q.audio_id ? `/api/sessions/${s.id}/audio/${q.audio_id}` : null })),
+    });
+  }
+  const ownAttempt = /^\/api\/sessions\/([^/]+)\/audio\/([^/]+)$/.exec(url.pathname);
+  if (req.method === 'GET' && ownAttempt) {
+    const session = await authorizeSession(req, env, ownAttempt[1]);
+    if (!session) return fail('找不到作答紀錄', 404);
+    const meta = await env.DB.prepare('SELECT * FROM attempts WHERE session_id=? AND id=? AND deleted_at IS NULL').bind(session.id, ownAttempt[2]).first();
+    return meta ? audioResponse(req, env.AUDIO, meta) : fail('找不到錄音', 404);
+  }
   if (req.method === "POST" && url.pathname === "/api/sessions") {
     const b = await bodyJson(req),
       a = await assignmentByCode(env, b.code);
@@ -1028,7 +1151,8 @@ async function api(req, env, url) {
         identityMode === "anonymous" ? `匿名-${token(3).toUpperCase()}` : null;
     const statements = [
       env.DB.prepare(
-        "INSERT INTO sessions(id,token_hash,assignment_id,name,student_id,anonymous_id,device_test_confirmed_at,started_at,voice_profile,student_account_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        `INSERT INTO sessions(id,token_hash,assignment_id,name,student_id,anonymous_id,device_test_confirmed_at,started_at,voice_profile,student_account_id,assignment_language,assignment_cefr,assignment_vocabulary_version)
+         SELECT ?,?,?,?,?,?,?,?,?,?,language,cefr,vocabulary_version FROM assignments WHERE id=? AND revision=? AND deleted_at IS NULL AND publication_state='published'`,
       ).bind(
         sessionId,
         await hash(sessionToken),
@@ -1040,14 +1164,15 @@ async function api(req, env, url) {
         now,
         a.deidentify_voice ? profile : null,
         identityMode === "anonymous" ? null : (account?.id || null),
+        a.id,
+        a.revision,
       ),
-      ...qs.map((q) =>
-        env.DB.prepare(
-          "INSERT INTO answers(session_id,sentence_id) VALUES(?,?)",
-        ).bind(sessionId, q.id),
-      ),
+      env.DB.prepare(`INSERT INTO answers(session_id,sentence_id,question_position,question_text,question_pinyin,max_attempts_snapshot,recording_seconds_snapshot)
+        SELECT s.id,se.id,se.position,se.text,se.pinyin,COALESCE(se.max_attempts,a.max_attempts),COALESCE(se.recording_seconds,a.recording_seconds)
+        FROM sessions s JOIN assignments a ON a.id=s.assignment_id JOIN sentences se ON se.assignment_id=a.id WHERE s.id=?`).bind(sessionId),
     ];
-    await env.DB.batch(statements);
+    const [created] = await env.DB.batch(statements);
+    if (!created.meta.changes) return fail('作業已更新，請重新輸入代碼', 409);
     return response(
       {
         sessionId,
@@ -1071,14 +1196,16 @@ async function api(req, env, url) {
     const length = Number(req.headers.get("content-length") || 0);
     if (length > MAX_AUDIO) return fail("音訊檔超過 15MB", 413);
     const q = await env.DB.prepare(
-      `SELECT se.position,COALESCE(se.max_attempts,a.max_attempts) max_attempts,a.ends_at,a.deidentify_voice,an.accepted_attempt,(SELECT COUNT(*) FROM attempts t WHERE t.session_id=an.session_id AND t.sentence_id=an.sentence_id) used,(SELECT COUNT(*) FROM answers prior JOIN sentences ps ON ps.id=prior.sentence_id WHERE prior.session_id=an.session_id AND ps.position<se.position AND prior.accepted_attempt IS NULL) incomplete FROM answers an JOIN sentences se ON se.id=an.sentence_id JOIN assignments a ON a.id=se.assignment_id WHERE an.session_id=? AND an.sentence_id=?`,
+      `SELECT an.max_attempts_snapshot max_attempts,an.recording_seconds_snapshot recording_seconds,a.ends_at,a.deidentify_voice,an.accepted_attempt,
+        (SELECT COUNT(*) FROM attempts t WHERE t.session_id=an.session_id AND t.sentence_id=an.sentence_id) used
+        FROM answers an JOIN sentences se ON se.id=an.sentence_id JOIN assignments a ON a.id=se.assignment_id
+        WHERE an.session_id=? AND an.sentence_id=?`,
     )
       .bind(s.id, m[2])
       .first();
     if (!q) return fail("找不到題目", 404);
     if (q.ends_at && new Date().toISOString() >= q.ends_at)
       return fail("作業已結束", 403);
-    if (q.incomplete) return fail("必須依序完成題目", 409);
     if (q.accepted_attempt) return fail("題目已完成", 409);
     if (q.used >= q.max_attempts) return fail("已達錄製次數上限", 409);
     const transformProfile = req.headers.get("x-transform-profile"),
@@ -1093,16 +1220,21 @@ async function api(req, env, url) {
     const audio = await req.arrayBuffer();
     if (audio.byteLength < 100) return fail("未收到有效音訊資料");
     if (audio.byteLength > MAX_AUDIO) return fail("音訊檔超過 15MB", 413);
+    let duration;
     try {
-      if (type !== 'audio/wav' || wavDuration(audio) > 180) return fail('每次錄音最多三分鐘，請重新載入頁面後錄製', 400);
+      if (type !== 'audio/wav' || (duration = wavDuration(audio)) > q.recording_seconds) return fail(`每次錄音最多 ${q.recording_seconds} 秒`, 400);
     } catch (error) { return fail(error.message); }
     const attemptId = id("r"),
       number = q.used + 1,
       key = `${s.assignment_id}/${s.id}/${m[2]}/${attemptId}.${ext(type)}`;
     await env.AUDIO.put(key, audio, { httpMetadata: { contentType: type } });
     try {
-      await env.DB.prepare(
-        `INSERT INTO attempts(id,session_id,sentence_id,attempt_number,r2_key,mime_type,byte_size,created_at,transform_profile,transform_version) SELECT ?,?,?,?,?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM attempts WHERE session_id=? AND sentence_id=?) < ? AND (SELECT accepted_attempt FROM answers WHERE session_id=? AND sentence_id=?) IS NULL`,
+      const inserted = await env.DB.prepare(
+        `INSERT INTO attempts(id,session_id,sentence_id,attempt_number,r2_key,mime_type,byte_size,created_at,transform_profile,transform_version,duration_seconds) SELECT ?,?,?,?,?,?,?,?,?,?,?
+         WHERE (SELECT COUNT(*) FROM attempts WHERE session_id=? AND sentence_id=?) < ?
+         AND EXISTS (SELECT 1 FROM answers an JOIN sessions s ON s.id=an.session_id JOIN assignments a ON a.id=s.assignment_id
+           WHERE an.session_id=? AND an.sentence_id=? AND an.accepted_attempt IS NULL AND s.completed_at IS NULL
+             AND s.deleted_at IS NULL AND a.deleted_at IS NULL AND (a.ends_at IS NULL OR a.ends_at>?))`,
       )
         .bind(
           attemptId,
@@ -1115,13 +1247,19 @@ async function api(req, env, url) {
           new Date().toISOString(),
           q.deidentify_voice ? transformProfile : null,
           q.deidentify_voice ? transformVersion : null,
+          duration,
           s.id,
           m[2],
           q.max_attempts,
           s.id,
           m[2],
+          new Date().toISOString(),
         )
         .run();
+      if (!inserted.meta.changes) {
+        await env.AUDIO.delete(key);
+        return fail('作業或錄音狀態已變更，請重新整理', 409);
+      }
     } catch (e) {
       await env.AUDIO.delete(key);
       return fail("錄製次數已由另一個請求使用，請重新整理", 409);
@@ -1155,11 +1293,14 @@ async function api(req, env, url) {
       .first();
     if (!latest?.n) return fail("尚無成功儲存的錄音");
     const r = await env.DB.prepare(
-      "UPDATE answers SET accepted_attempt=? WHERE session_id=? AND sentence_id=? AND accepted_attempt IS NULL",
+      `UPDATE answers SET accepted_attempt=? WHERE session_id=? AND sentence_id=? AND accepted_attempt IS NULL
+       AND EXISTS (SELECT 1 FROM sessions s JOIN assignments a ON a.id=s.assignment_id
+        WHERE s.id=answers.session_id AND s.deleted_at IS NULL AND s.completed_at IS NULL AND a.deleted_at IS NULL
+          AND (a.ends_at IS NULL OR a.ends_at>?))`,
     )
-      .bind(latest.n, s.id, m[2])
+      .bind(latest.n, s.id, m[2], new Date().toISOString())
       .run();
-    if (!r.meta.changes) return fail("題目已完成", 409);
+    if (!r.meta.changes) return fail("題目已完成或作業已截止", 409);
     return response({ acceptedAttempt: latest.n });
   }
   m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/complete$/);
@@ -1175,11 +1316,16 @@ async function api(req, env, url) {
     )
       return fail("仍有題目尚未完成", 409);
     const done = s.completed_at || new Date().toISOString();
-    await env.DB.prepare(
-      "UPDATE sessions SET completed_at=? WHERE id=? AND completed_at IS NULL",
-    )
-      .bind(done, s.id)
-      .run();
+    if (!s.completed_at) {
+      const saved = await env.DB.prepare(`UPDATE sessions SET completed_at=? WHERE id=? AND completed_at IS NULL AND deleted_at IS NULL
+        AND EXISTS (SELECT 1 FROM assignments a WHERE a.id=sessions.assignment_id AND a.deleted_at IS NULL
+          AND (a.ends_at IS NULL OR a.ends_at>?))`).bind(done, s.id, done).run();
+      if (!saved.meta.changes) {
+        const current = await authorizeSession(req, env, s.id);
+        if (!current?.completed_at) return fail('作業已截止或移入垃圾桶', 409);
+        return response({ completedAt: current.completed_at, name: current.name, studentId: current.student_id, anonymousId: current.anonymous_id });
+      }
+    }
     return response({
       completedAt: done,
       name: s.name,
@@ -1209,11 +1355,11 @@ async function api(req, env, url) {
 }
 
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     try {
       const url = new URL(req.url);
       return url.pathname.startsWith("/api/")
-        ? await api(req, env, url)
+        ? await api(req, env, url, ctx)
         : env.ASSETS.fetch(req);
     } catch (e) {
       console.error(e);
@@ -1222,5 +1368,6 @@ export default {
   },
   scheduled(_controller, env, ctx) {
     ctx.waitUntil(purgeExpired(env));
+    ctx.waitUntil(purgeStudentAudio(env));
   },
 };
